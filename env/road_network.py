@@ -66,7 +66,7 @@ class RoadNetwork:
         path = Path(raw_path)
         if path.exists():
             return path
-        root = Path(__file__).resolve().parents[2]
+        root = Path(__file__).resolve().parents[1]
         candidate = root / path
         if candidate.exists():
             return candidate

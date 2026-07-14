@@ -1,0 +1,7 @@
+base: scenario_60node_rainbow_test.yaml
+
+recovery:
+  rule: fifo
+
+recovery_insertion:
+  enabled: false

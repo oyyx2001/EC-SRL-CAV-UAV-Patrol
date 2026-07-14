@@ -1,0 +1,35 @@
+base: scenario_60node_rainbow_test.yaml
+
+# Keep the observation/action dimensions identical to the existing Rainbow model:
+# 3 UAVs * 8 candidates + one no-op action = 25 actions.
+sortie:
+  top_k_per_drone: 8
+
+training:
+  seed_mode: fixed
+
+rl:
+  algo: rainbow_dqn
+  timesteps: 1000000
+  train_scenario: small
+  eval_scenario: small
+  eval_seeds: [1000, 1001, 1002, 1003, 1004]
+  action_masking: true
+  hyperparams:
+    gamma: 0.99
+    lr: 0.0001
+    batch_size: 128
+    replay_buffer_size: 100000
+    learning_starts: 5000
+    target_update_interval: 2000
+    epsilon_start: 0.0
+    epsilon_final: 0.0
+    epsilon_decay_steps: 1
+    max_grad_norm: 10.0
+    eval_interval: 20000
+    candidate_dim: 6
+    prioritized_replay_alpha: 0.6
+    prioritized_replay_beta_start: 0.4
+    prioritized_replay_beta_final: 1.0
+    prioritized_replay_beta_steps: 200000
+    priority_epsilon: 0.000001

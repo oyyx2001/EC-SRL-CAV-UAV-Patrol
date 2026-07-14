@@ -27,6 +27,23 @@ class EpisodeMetrics:
     illegal_actions: int = 0
     avg_tasks_per_sortie: float = 0.0
     num_sorties: int = 0
+    uav_energy_per_completed_task: float = math.nan
+    mean_uav_recovery_wait_s: float = 0.0
+    p95_uav_recovery_wait_s: float = 0.0
+    total_uav_hover_time_s: float = 0.0
+    total_hover_energy: float = 0.0
+    mean_cav_waiting_time_s: float = 0.0
+    cav_travel_distance_m: float = 0.0
+    recovery_contention_rate: float = 0.0
+    non_append_rate: float = 0.0
+    mean_insertion_displacement: float = 0.0
+    mean_counterfactual_gain: float = 0.0
+    locked_queue_rate: float = 0.0
+    no_feasible_insertion_rate: float = 0.0
+    dynamic_insertion_computation_time_ms: float = 0.0
+    recovery_attempts: int = 0
+    infeasible_recoveries: int = 0
+    minimum_battery_observed: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -1,0 +1,11 @@
+base: scenario_60node_stage2_rainbow_common.yaml
+
+recovery:
+  rule: fifo
+
+recovery_insertion:
+  enabled: false
+
+rl:
+  run_name: stage2_rainbow_fifo_seed42
+  model_name: RainbowDQN_stage2_fifo_seed42.pt

@@ -1,0 +1,10 @@
+base: scenario_60node_rainbow_test.yaml
+
+sortie:
+  top_k_per_drone: 8
+
+recovery:
+  rule: fifo
+
+recovery_insertion:
+  enabled: false

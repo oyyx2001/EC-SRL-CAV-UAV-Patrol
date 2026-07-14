@@ -1,0 +1,10 @@
+base: scenario_60node_rainbow_test.yaml
+
+sortie:
+  top_k_per_drone: 8
+
+recovery:
+  rule: dynamic_insertion
+
+recovery_insertion:
+  enabled: true

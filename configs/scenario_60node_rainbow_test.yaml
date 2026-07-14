@@ -34,6 +34,20 @@ agents:
   battery_swap_time_s: 0
   launch_time_s: 0
   recovery_time_s: 0
+recovery:
+  rule: fifo
+recovery_insertion:
+  enabled: false
+  lock_horizon_s: 120
+  preserve_locked_prefix: true
+  weight_uav_wait: 1.0
+  weight_existing_delay: 0.5
+  weight_cav_wait: 0.25
+  weight_route_time: 0.10
+  battery_reserve: 0.0
+  use_battery_feasibility: true
+  cache_candidate_evaluation: true
+  log_insertion_details: true
 tasks:
   routine_interval_s: 200
   incident_rate_per_hour: 8

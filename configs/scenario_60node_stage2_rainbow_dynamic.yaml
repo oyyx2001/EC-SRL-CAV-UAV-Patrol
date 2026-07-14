@@ -1,0 +1,11 @@
+base: scenario_60node_stage2_rainbow_common.yaml
+
+recovery:
+  rule: dynamic_insertion
+
+recovery_insertion:
+  enabled: true
+
+rl:
+  run_name: stage2_rainbow_dynamic_seed42
+  model_name: RainbowDQN_stage2_dynamic_seed42.pt

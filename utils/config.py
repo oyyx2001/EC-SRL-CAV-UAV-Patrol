@@ -20,7 +20,7 @@ def deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 def load_config(path: str | Path) -> Dict[str, Any]:
     path = Path(path)
     if not path.exists():
-        root = Path(__file__).resolve().parents[2]
+        root = project_root()
         candidate = root / "configs" / str(path)
         if candidate.exists():
             path = candidate
@@ -36,7 +36,7 @@ def load_config(path: str | Path) -> Dict[str, Any]:
 
 
 def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[1]
 
 
 def ensure_dirs(cfg: Dict[str, Any]) -> Path:

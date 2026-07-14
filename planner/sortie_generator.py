@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from itertools import combinations, permutations
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import math
 
 import numpy as np
@@ -30,10 +30,15 @@ class Sortie:
     tasks_per_sortie: int = 1
     vehicle_anchor_node: Optional[int] = None
     vehicle_queue_time_s: float = 0.0
+    flight_service_energy: float = 0.0
+    battery_at_eta: float = 0.0
+    base_feasible: bool = True
+    insertion_evaluation: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict:
         d = asdict(self)
         d["segments"] = self.segments or []
+        d.pop("insertion_evaluation", None)
         return d
 
 
@@ -60,6 +65,7 @@ class SortieGenerator:
         no_priority: bool = False,
         recovery_anchor_node: Optional[int] = None,
         vehicle_queue_time_s: float = 0.0,
+        allow_recovery_reschedule: bool = False,
     ) -> List[Sortie]:
         if not drone.is_idle() or drone.position != vehicle_position:
             return []
@@ -109,7 +115,7 @@ class SortieGenerator:
                             vehicle_anchor_node=recovery_anchor_node,
                             vehicle_queue_time_s=vehicle_queue_time_s,
                         )
-                        if s.feasible:
+                        if s.feasible or (allow_recovery_reschedule and s.base_feasible):
                             candidates.append(s)
         # Diversity: avoid returning only same first task.
         candidates.sort(key=lambda s: s.score, reverse=True)
@@ -139,6 +145,7 @@ class SortieGenerator:
         no_priority: bool = False,
         recovery_anchor_node: Optional[int] = None,
         vehicle_queue_time_s: float = 0.0,
+        allow_recovery_reschedule: bool = False,
     ) -> List[Sortie]:
         out: List[Sortie] = []
         for d in drones:
@@ -153,6 +160,7 @@ class SortieGenerator:
                     no_priority,
                     recovery_anchor_node=recovery_anchor_node,
                     vehicle_queue_time_s=vehicle_queue_time_s,
+                    allow_recovery_reschedule=allow_recovery_reschedule,
                 )
             )
         return sorted(out, key=lambda s: s.score, reverse=True)
@@ -253,6 +261,9 @@ class SortieGenerator:
                 len(tasks),
                 int(launch_node if vehicle_anchor_node is None else vehicle_anchor_node),
                 float(vehicle_queue_time_s),
+                0.0,
+                float(drone.battery),
+                False,
             )
         if required_site_nodes and int(recovery_node) not in required_site_nodes:
             return Sortie(
@@ -272,6 +283,9 @@ class SortieGenerator:
                 len(tasks),
                 int(launch_node if vehicle_anchor_node is None else vehicle_anchor_node),
                 float(vehicle_queue_time_s),
+                0.0,
+                float(drone.battery),
+                False,
             )
         current = int(launch_node)
         elapsed = 0.0
@@ -312,22 +326,35 @@ class SortieGenerator:
             segments.append({"type": "fly", "from": current, "to": int(recovery_node), "duration": t_return, "task_id": None})
             elapsed += t_return
             energy += t_return * self.fly_power
+        flight_service_energy = float(energy)
+        battery_at_eta = float(drone.battery - flight_service_energy)
         anchor = int(launch_node if vehicle_anchor_node is None else vehicle_anchor_node)
         vehicle_leg_time = self.network.get_vehicle_time(anchor, recovery_node)
         vehicle_time = float(vehicle_queue_time_s) + float(vehicle_leg_time)
         if not math.isfinite(vehicle_time):
-            return Sortie(drone.id, int(launch_node), task_ids, task_ids, int(recovery_node), elapsed, vehicle_time, math.inf, energy, -1e9, False, "vehicle_unreachable", segments, len(task_ids), anchor, float(vehicle_queue_time_s))
+            return Sortie(
+                drone.id, int(launch_node), task_ids, task_ids, int(recovery_node), elapsed,
+                vehicle_time, math.inf, energy, -1e9, False, "vehicle_unreachable", segments,
+                len(task_ids), anchor, float(vehicle_queue_time_s), flight_service_energy,
+                battery_at_eta, False,
+            )
         drone_wait = max(0.0, vehicle_time - elapsed)
         vehicle_wait = max(0.0, elapsed - vehicle_time)
         energy += drone_wait * self.hover_power
         finish = now + max(elapsed, vehicle_time)
         battery_capacity = drone.battery
+        base_feasible = True
         feasible = True
         reason = "ok"
         if deadline_violation:
+            base_feasible = False
             feasible = False
             reason = "deadline"
-        if energy > battery_capacity + 1e-9:
+        if flight_service_energy > battery_capacity + 1e-9:
+            base_feasible = False
+            feasible = False
+            reason = "battery"
+        elif energy > battery_capacity + 1e-9:
             feasible = False
             reason = "battery"
         if bool(self.ablation_cfg.get("priority_urgency_score", True)):
@@ -355,4 +382,7 @@ class SortieGenerator:
             tasks_per_sortie=len(task_ids),
             vehicle_anchor_node=anchor,
             vehicle_queue_time_s=float(vehicle_queue_time_s),
+            flight_service_energy=flight_service_energy,
+            battery_at_eta=battery_at_eta,
+            base_feasible=bool(base_feasible),
         )
