@@ -1,0 +1,79 @@
+project:
+  name: dynamic_patrol_marl_jiangning_osm
+  seed: 42
+  results_dir: results
+simulation:
+  horizon_s: 3600
+  decision_interval_s: 60
+  dt_s: 10
+  high_priority_threshold: 8
+network:
+  type: imported_osm
+  path: data/jiangning_osm/jiangning_osm_intersections.json
+  force_bidirectional: true
+  patrol_center: center
+  vehicle_speed_mps: 8.3
+  drone_speed_mps: 14.0
+  risk_seed_shift: 100
+  high_risk_fraction: 0.25
+agents:
+  num_vehicles: 1
+  num_drones: 3
+  drone_battery_capacity: 1800.0
+  drone_fly_power: 1.0
+  drone_hover_power: 0.65
+  drone_service_power: 0.85
+  battery_swap_time_s: 0
+  launch_time_s: 0
+  recovery_time_s: 0
+tasks:
+  routine_interval_s: 200
+  incident_rate_per_hour: 8
+  congestion_rate_per_hour: 10
+  congestion_group_max_arcs: 3
+  deadline_s:
+    routine: 3600
+    incident: 420
+    congestion: 720
+  service_time_s:
+    routine: 45
+    incident: 60
+    congestion: 90
+  priority:
+    routine: 2
+    incident: 10
+    congestion: 6
+  incident_vehicle_required_prob: 0.30
+sortie:
+  top_k_per_drone: 8
+  max_tasks_per_sortie: 3
+  recovery_candidates: 4
+  recovery_center_radius_m: 900
+  allow_multi_task: true
+  candidate_pool_tasks: 12
+baseline:
+  seeds: 30
+  methods: [nearest_task, priority_greedy, edf, score_based, rolling_horizon, static_reopt, random_masked]
+training:
+  seed_mode: random
+reward:
+  done_task: 30.0
+  priority_bonus: 2.0
+  timeout_penalty: -30.0
+  undone_task_penalty: -20.0
+  response_penalty: -0.01
+  energy_penalty: -0.001
+  wait_penalty: -0.005
+  reasonable_wait_penalty: 0.0
+  busy_wait_penalty: 0.0
+  routine_wait_penalty: -0.3
+  incident_wait_penalty: -2.0
+  dynamic_wait_penalty: -1.5
+  urgent_wait_penalty: -3.0
+  recovery_wait_penalty: -3.0
+  recovery_queue_penalty: -0.05
+  vehicle_recovery_time_penalty: -0.0005
+  urgent_wait_threshold_s: 120
+  aoi_penalty: -0.00001
+visualization:
+  dpi: 160

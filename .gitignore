@@ -1,0 +1,36 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+envs/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Experiment outputs and logs
+results/
+runs/
+logs/
+*.log
+
+# Model/checkpoint artifacts
+*.pt
+*.pth
+*.zip
+*.ckpt
+*.pkl
+
+# Temporary files
+*.tmp
+*.bak
+~$*
