@@ -224,7 +224,8 @@ def train_metric_row(
         "episode_steps": int(episode_steps),
         "episode_reward": float(episode_reward),
         "epsilon": float(epsilon),
-        "loss": float(latest_loss) if np.isfinite(latest_loss) else np.nan,
+        "loss": float(latest_loss) if np.isfinite(latest_loss) else 0.0,
+        "loss_available": bool(np.isfinite(latest_loss)),
         "completion_rate": metrics.get("completion_rate", np.nan),
         "timeout_rate": metrics.get("timeout_rate", np.nan),
         "illegal_actions": metrics.get("illegal_actions", np.nan),
@@ -305,6 +306,8 @@ def save_outputs(
     stages: List[Dict],
     action_masking: bool,
     replay_config: Dict | None = None,
+    feature_schema: Dict | None = None,
+    decision_mode: str = "sortie_only",
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -327,6 +330,8 @@ def save_outputs(
             "action_dim": int(action_dim),
             "candidate_dim": int(hp.candidate_dim),
             "replay_config": dict(replay_config or {}),
+            "decision_mode": str(decision_mode),
+            "feature_schema": dict(feature_schema or {}),
             "model_state_dict": online_net.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
         },
@@ -353,6 +358,8 @@ def save_outputs(
         "training_stages": json.dumps(stages),
         "replay_schema_version": int((replay_config or {}).get("schema_version", 1)),
         "time_mode": str((replay_config or {}).get("time_mode", "fixed_interval")),
+        "decision_mode": str(decision_mode),
+        "feature_schema_version": int((feature_schema or {}).get("schema_version", 0)),
         **asdict(hp),
     }
     if not final_eval.empty:
@@ -432,7 +439,11 @@ def train_masked_dqn(
     obs, mask = reset_env(env)
     obs_dim = int(env.observation_space.shape[0])
     action_dim = int(env.action_space.n)
-    expected_action_dim = 1 + int(cfg["agents"].get("num_drones", 2)) * int(cfg["sortie"].get("top_k_per_drone", 8))
+    if env.decision_mode == "joint_plan":
+        expected_action_dim = 1 + int(cfg.get("joint_plan", {}).get("max_non_safe_plans", 24))
+        hp.candidate_dim = int(env.plan_feature_dim)
+    else:
+        expected_action_dim = 1 + int(cfg["agents"].get("num_drones", 2)) * int(cfg["sortie"].get("top_k_per_drone", 8))
     if action_dim != expected_action_dim:
         raise ValueError(f"action_dim mismatch: env={action_dim}, expected={expected_action_dim}")
 
@@ -654,6 +665,11 @@ def train_masked_dqn(
             stage_name=stages[current_stage_idx].name,
         )
         training_rows.append(row)
+        row["simulated_time_s"] = float(env.sim.now)
+        row["decisions_per_episode"] = int(getattr(env, "decision_index", episode_steps))
+        row["gradient_updates"] = int(gradient_updates)
+        row["replay_transitions"] = int(len(replay))
+        row["training_simulated_seconds"] = float(training_simulated_seconds)
         if writer is not None:
             write_train_scalars(writer, row, effective_timesteps)
 
@@ -685,6 +701,12 @@ def train_masked_dqn(
             for stage in stages
         ],
         action_masking=action_masking,
+        decision_mode=env.decision_mode,
+        feature_schema=(
+            env.sim.joint_plan_generator.feature_builder.schema()
+            if env.sim is not None and env.sim.joint_plan_generator is not None
+            else {}
+        ),
         replay_config={
             **replay.state_dict(),
             "n_step": n_step,

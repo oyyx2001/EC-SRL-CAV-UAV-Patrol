@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover - fallback keeps baseline code runnable wi
 from dynamic_patrol_marl.env.simulator import Simulator
 from dynamic_patrol_marl.env.events import Event, EventQueue
 from dynamic_patrol_marl.planner.sortie_generator import Sortie
+from dynamic_patrol_marl.planner.joint_plan import JointPlan, JointPlanCache
 from dynamic_patrol_marl.rl.smdp import transition_discount
 
 
@@ -63,14 +64,23 @@ class DynamicPatrolEnv(BaseEnv):
         self.episode_seed_start = int(cfg["project"].get("seed", 42) if episode_seed_start is None else episode_seed_start)
         self.episode_idx = 0
         self.seed_scheduler = seed_scheduler
-        self.max_actions = 1 + int(cfg["agents"].get("num_drones", 2)) * int(cfg["sortie"].get("top_k_per_drone", 8))
+        inferred_mode = "separate_control" if str(cfg.get("cav_control", {}).get("mode", "passive")).lower() == "active_rule_based" else "sortie_only"
+        self.decision_mode = str(cfg.get("decision_mode", inferred_mode)).lower()
+        self.plan_feature_dim = 38 if self.decision_mode == "joint_plan" else 6
+        if self.decision_mode == "joint_plan":
+            self.max_actions = 1 + int(cfg.get("joint_plan", {}).get("max_non_safe_plans", 24))
+        else:
+            self.max_actions = 1 + int(cfg["agents"].get("num_drones", 2)) * int(cfg["sortie"].get("top_k_per_drone", 8))
         self.max_tasks_obs = 10
-        self.max_candidates_obs = self.max_actions - 1
-        self.obs_dim = 6 + int(cfg["agents"].get("num_drones", 2)) * 3 + self.max_tasks_obs * 6 + self.max_candidates_obs * 6
+        self.max_candidates_obs = self.max_actions if self.decision_mode == "joint_plan" else self.max_actions - 1
+        self.global_obs_dim = 6 + int(cfg["agents"].get("num_drones", 2)) * 3 + self.max_tasks_obs * 6
+        self.obs_dim = self.global_obs_dim + self.max_candidates_obs * self.plan_feature_dim
         self.action_space = spaces.Discrete(self.max_actions) if spaces else SimpleDiscrete(self.max_actions)
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32) if spaces else SimpleBox((self.obs_dim,))
         self.sim: Optional[Simulator] = None
         self.candidates: List[Sortie] = []
+        self.joint_plan_cache: Optional[JointPlanCache] = None
+        self._ground_action_committed_time: Optional[float] = None
         self.last_metrics = None
         time_cfg = cfg.get("time", {})
         self.time_mode = str(time_cfg.get("mode", cfg.get("time_mode", "fixed_interval"))).lower()
@@ -88,6 +98,7 @@ class DynamicPatrolEnv(BaseEnv):
         self.transition_log: List[Dict[str, Any]] = []
         self.event_timeline: List[Dict[str, Any]] = []
         self.decision_index = 0
+        self._decision_epoch_serial = 0
         self.meaningful_decisions = 0
         self.forced_wait_decisions = 0
         self.instantaneous_decisions = 0
@@ -115,6 +126,7 @@ class DynamicPatrolEnv(BaseEnv):
         self.transition_log = []
         self.event_timeline = []
         self.decision_index = 0
+        self._decision_epoch_serial = 0
         self.meaningful_decisions = 0
         self.forced_wait_decisions = 0
         self.instantaneous_decisions = 0
@@ -128,7 +140,9 @@ class DynamicPatrolEnv(BaseEnv):
         self._pending_ground_trigger_events = ["INITIAL_DECISION"]
         if self.time_mode == "event_driven":
             self._initialize_event_queue()
-        self.candidates = self.sim.get_candidates(no_multitask=self.no_multitask, no_priority=self.no_priority)
+        self.joint_plan_cache = None
+        self._ground_action_committed_time = None
+        self._prepare_decision_epoch(["INITIAL_DECISION"])
         obs = self._observation()
         initial_mask = self.action_masks()
         info = {
@@ -147,6 +161,46 @@ class DynamicPatrolEnv(BaseEnv):
             return self._step_event_driven(action)
         return self._step_fixed_interval(action)
 
+    def _prepare_decision_epoch(self, trigger_events: Optional[List[str]] = None) -> None:
+        assert self.sim is not None
+        if self.decision_mode != "joint_plan":
+            self.candidates = self.sim.get_candidates(
+                no_multitask=self.no_multitask, no_priority=self.no_priority
+            )
+            return
+        assert self.sim.joint_plan_generator is not None
+        if self.joint_plan_cache is not None:
+            cache = self.joint_plan_cache
+            if (
+                abs(float(cache.decision_time) - float(self.sim.now)) <= 1e-9
+                and cache.state_fingerprint == self.sim.joint_plan_generator.state_fingerprint()
+                and cache.schedule_versions == self.sim.joint_plan_generator.schedule_versions()
+            ):
+                return
+        next_event_time = None
+        if self.event_queue is not None:
+            next_event_time = self.event_queue.peek_time(self.sim.now, self._event_version)
+        same_timestamp = (
+            self._ground_action_committed_time is not None
+            and abs(float(self._ground_action_committed_time) - float(self.sim.now)) <= 1e-9
+        )
+        event_types = list(trigger_events or [])
+        event_code = 0.0
+        if event_types:
+            event_code = (sum(ord(ch) for ch in event_types[0]) % 101) / 100.0
+        self.joint_plan_cache = self.sim.joint_plan_generator.generate_joint_plans(
+            {
+                "decision_epoch_id": int(self._decision_epoch_serial),
+                "event_sequence_id": int(self.system_events_processed),
+                "next_event_time": next_event_time,
+                "event_type_code": event_code,
+                "instantaneous_dispatch": same_timestamp,
+                "ground_action_committed_at_timestamp": same_timestamp,
+            }
+        )
+        self._decision_epoch_serial += 1
+        self.candidates = []
+
     def _step_fixed_interval(self, action: int):
         assert self.sim is not None, "call reset first"
         wall_start = time.perf_counter()
@@ -158,9 +212,21 @@ class DynamicPatrolEnv(BaseEnv):
         mask = self.action_masks()
         illegal = False
         selected = None
+        selected_plan = None
         if action < 0 or action >= self.max_actions or not bool(mask[action]):
             illegal = True
             self.sim.illegal_actions += 1
+        elif self.decision_mode == "joint_plan":
+            assert self.joint_plan_cache is not None and self.sim.joint_plan_generator is not None
+            committed, selected_plan = self.sim.joint_plan_generator.commit_joint_plan(
+                self.joint_plan_cache, int(action)
+            )
+            self.joint_plan_cache = None
+            if not committed:
+                illegal = True
+                self.sim.illegal_actions += 1
+            elif selected_plan is not None:
+                selected = selected_plan.sortie
         elif action > 0:
             idx = action - 1
             if idx < len(self.candidates):
@@ -169,7 +235,7 @@ class DynamicPatrolEnv(BaseEnv):
         before_done = len(before_done_ids)
         before_expired = sum(t.status == "expired" for t in self.sim.tasks)
         wait_penalty = self._wait_penalty(action)
-        launched = self.sim.dispatch_sorties(selected)
+        launched = int(selected is not None) if self.decision_mode == "joint_plan" and not illegal else self.sim.dispatch_sorties(selected)
         # A launch consumes a UAV but not a CAV movement decision. If another
         # idle UAV remains on the CAV, return immediately so PPO can launch
         # multiple UAVs from the same intersection through consecutive actions.
@@ -210,7 +276,7 @@ class DynamicPatrolEnv(BaseEnv):
             )
             reward_components = {"other": float(reward)}
         truncated = False
-        self.candidates = self.sim.get_candidates(no_multitask=self.no_multitask, no_priority=self.no_priority)
+        self._prepare_decision_epoch(["FIXED_INTERVAL"])
         obs = self._observation()
         info = {
             "action_mask": self.action_masks(),
@@ -444,8 +510,23 @@ class DynamicPatrolEnv(BaseEnv):
 
         illegal = bool(action < 0 or action >= self.max_actions or not bool(source_mask[action]))
         selected: Optional[Sortie] = None
+        selected_plan: Optional[JointPlan] = None
+        ground_action = None
         if illegal:
             self.sim.illegal_actions += 1
+        elif self.decision_mode == "joint_plan":
+            assert self.joint_plan_cache is not None and self.sim.joint_plan_generator is not None
+            committed, selected_plan = self.sim.joint_plan_generator.commit_joint_plan(
+                self.joint_plan_cache, int(action)
+            )
+            self.joint_plan_cache = None
+            if not committed:
+                illegal = True
+                self.sim.illegal_actions += 1
+            elif selected_plan is not None:
+                selected = selected_plan.sortie
+                ground_action = selected_plan.ground_candidate
+                self._ground_action_committed_time = decision_time
         elif int(action) > 0:
             candidate_index = int(action) - 1
             if candidate_index < len(self.candidates):
@@ -455,7 +536,7 @@ class DynamicPatrolEnv(BaseEnv):
             selected_sortie_id = self.sim.recovery_scheduler.sortie_id(selected)
         before = self._reward_snapshot()
         wait_penalty = self._wait_penalty(action)
-        launched = self.sim.dispatch_sorties(selected)
+        launched = int(selected is not None) if self.decision_mode == "joint_plan" and not illegal else self.sim.dispatch_sorties(selected)
         trigger_events: List[str] = ["UAV_LAUNCH"] if launched > 0 else []
         processed_event_count = len(trigger_events)
 
@@ -466,7 +547,7 @@ class DynamicPatrolEnv(BaseEnv):
             self._instantaneous_count += 1
         configured_max = self.event_cfg.get("max_instantaneous_decisions", "auto")
         max_instantaneous = len(self.sim.drones) if str(configured_max).lower() == "auto" else int(configured_max)
-        self.candidates = self.sim.get_candidates(no_multitask=self.no_multitask, no_priority=self.no_priority)
+        self._prepare_decision_epoch(["UAV_LAUNCH"] if launched > 0 else [])
         allow_instantaneous = bool(self.event_cfg.get("allow_instantaneous_multi_dispatch", True))
         instantaneous_dispatch = bool(
             allow_instantaneous
@@ -475,21 +556,18 @@ class DynamicPatrolEnv(BaseEnv):
             and self._instantaneous_count < max(1, max_instantaneous)
         )
 
-        ground_action = None
         if launched > 0:
             self._pending_ground_trigger_events.extend(
                 ["UAV_LAUNCH", "RECOVERY_QUEUE_UPDATED", "DYNAMIC_RECOVERY_INSERTION_COMPLETE"]
             )
-        if not instantaneous_dispatch:
+        if not instantaneous_dispatch and self.decision_mode != "joint_plan":
             next_ground_event = self.event_queue.peek_time(self.sim.now, self._event_version)
             ground_action = self.sim.ground_controller.decide(
                 list(dict.fromkeys(self._pending_ground_trigger_events)),
                 next_event_time=next_ground_event,
             )
             self._pending_ground_trigger_events = []
-            self.candidates = self.sim.get_candidates(
-                no_multitask=self.no_multitask, no_priority=self.no_priority
-            )
+            self._prepare_decision_epoch(self._pending_ground_trigger_events)
 
         if instantaneous_dispatch:
             self.instantaneous_decisions += 1
@@ -536,10 +614,12 @@ class DynamicPatrolEnv(BaseEnv):
                 ):
                     self._pending_ground_trigger_events.append("RECOVERY_QUEUE_UPDATED")
                 state_after = self._state_summary()
-                self.candidates = self.sim.get_candidates(no_multitask=self.no_multitask, no_priority=self.no_priority)
+                if self._ground_action_committed_time is not None and self.sim.now > self._ground_action_committed_time + 1e-9:
+                    self._ground_action_committed_time = None
+                self._prepare_decision_epoch(batch_types)
                 next_mask_for_decision = self.action_masks()
                 decision_triggered = bool(next_mask_for_decision[1:].any()) and not self._episode_terminated()
-                if not decision_triggered and not self._episode_terminated():
+                if not decision_triggered and not self._episode_terminated() and self.decision_mode != "joint_plan":
                     next_ground_event = self.event_queue.peek_time(self.sim.now, self._event_version)
                     automatic_ground_action = self.sim.ground_controller.decide(
                         list(dict.fromkeys(self._pending_ground_trigger_events)),
@@ -548,9 +628,7 @@ class DynamicPatrolEnv(BaseEnv):
                     if automatic_ground_action is not None:
                         ground_action = automatic_ground_action
                     self._pending_ground_trigger_events = []
-                    self.candidates = self.sim.get_candidates(
-                        no_multitask=self.no_multitask, no_priority=self.no_priority
-                    )
+                    self._prepare_decision_epoch(self._pending_ground_trigger_events)
                     next_mask_for_decision = self.action_masks()
                     decision_triggered = bool(next_mask_for_decision[1:].any()) and not self._episode_terminated()
                 for event_type in batch_types or ["STATE_ADVANCE"]:
@@ -596,12 +674,14 @@ class DynamicPatrolEnv(BaseEnv):
         self.sim.reward_total += reward
         self._delta_t_history.append(delta_t)
         self._discount_history.append(discount)
-        self.candidates = self.sim.get_candidates(no_multitask=self.no_multitask, no_priority=self.no_priority)
+        self._prepare_decision_epoch(trigger_events)
         next_mask = self.action_masks()
         obs = self._observation()
         wall_ms = (time.perf_counter() - wall_start) * 1000.0
         trigger_events = list(dict.fromkeys(trigger_events))
-        action_type = "illegal" if illegal else ("wait" if int(action) == 0 else "sortie")
+        action_type = "illegal" if illegal else (
+            selected_plan.plan_type if selected_plan is not None else ("wait" if int(action) == 0 else "sortie")
+        )
         info = {
             "action_mask": next_mask,
             "time": float(self.sim.now),
@@ -697,6 +777,10 @@ class DynamicPatrolEnv(BaseEnv):
         }
 
     def action_masks(self) -> np.ndarray:
+        if self.decision_mode == "joint_plan":
+            if self.joint_plan_cache is None:
+                raise RuntimeError("joint plan decision cache has not been prepared")
+            return self.joint_plan_cache.action_mask.copy()
         mask = np.zeros(self.max_actions, dtype=bool)
         mask[0] = True
         for i, c in enumerate(self.candidates[: self.max_actions - 1], start=1):
@@ -812,7 +896,11 @@ class DynamicPatrolEnv(BaseEnv):
                 t.end_node / n_nodes,
             ])
         obs.extend([0.0] * ((self.max_tasks_obs - len(tasks)) * 6))
-        if use_candidate_features:
+        if self.decision_mode == "joint_plan":
+            if self.joint_plan_cache is None:
+                raise RuntimeError("joint plan decision cache has not been prepared")
+            obs.extend(self.joint_plan_cache.feature_matrix.reshape(-1).tolist())
+        elif use_candidate_features:
             for c in self.candidates[: self.max_candidates_obs]:
                 obs.extend([
                     c.score / 100.0,

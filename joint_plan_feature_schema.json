@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "feature_dim": 38,
+  "feature_names": [
+    "normalized_task_count", "priority_sum", "maximum_priority", "maximum_urgency",
+    "minimum_deadline_slack", "predicted_aoi_reduction", "task_coverage_gain",
+    "sortie_duration", "outbound_and_service_energy", "return_distance", "return_time",
+    "return_energy", "total_uav_energy", "battery_slack", "cav_travel_time",
+    "cav_travel_distance", "detour_distance", "detour_ratio", "route_switch_flag",
+    "ground_action_type", "recovery_wait", "cav_wait", "existing_queue_delay",
+    "hover_energy", "insertion_cost", "rendezvous_slack", "minimum_recovery_slack",
+    "queue_length", "locked_prefix_length", "idle_uav_ratio", "pending_task_count",
+    "high_priority_task_count", "event_type", "instantaneous_dispatch_flag", "is_safe",
+    "is_type_I", "is_type_II", "is_type_III"
+  ],
+  "scales": {"distance_m": 3600.0, "time_s": 600.0, "energy": 1800.0, "tasks": 10.0},
+  "clip": [-5.0, 5.0],
+  "missing_value": 0.0
+}

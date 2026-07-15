@@ -65,6 +65,35 @@ class EpisodeMetrics:
     mean_predicted_gain_vs_keep: float = 0.0
     mean_realized_gain_vs_keep: float = 0.0
     maximum_cav_detour_ratio: float = 0.0
+    mean_generated_plans: float = 0.0
+    mean_valid_plans: float = 0.0
+    minimum_valid_plans: int = 0
+    maximum_valid_plans: int = 0
+    safe_plan_rate: float = 0.0
+    safe_only_decision_rate: float = 0.0
+    padding_rate: float = 0.0
+    ground_only_plan_rate: float = 0.0
+    joint_launch_ground_rate: float = 0.0
+    type_I_generated_rate: float = 0.0
+    type_II_generated_rate: float = 0.0
+    type_III_generated_rate: float = 0.0
+    type_I_selected_rate: float = 0.0
+    type_II_selected_rate: float = 0.0
+    type_III_selected_rate: float = 0.0
+    return_guard_rejection_rate: float = 0.0
+    commit_failure_count: int = 0
+    rollback_count: int = 0
+    atomic_commit_failure_rate: float = 0.0
+    rollback_rate: float = 0.0
+    candidate_truncation_count: int = 0
+    stale_plan_cache_count: int = 0
+    mask_inconsistency_count: int = 0
+    mean_plan_generation_time_ms: float = 0.0
+    p95_plan_generation_time_ms: float = 0.0
+    mean_plan_evaluation_time_ms: float = 0.0
+    p95_plan_evaluation_time_ms: float = 0.0
+    plan_feature_clipping_rate: float = 0.0
+    joint_plan_decisions: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

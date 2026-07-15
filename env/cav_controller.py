@@ -98,6 +98,16 @@ class ActiveCAVController:
     def active(self) -> bool:
         return self.mode == "active_rule_based" and len(self.action_set) > 1
 
+    @property
+    def candidate_generation_enabled(self) -> bool:
+        """Whether non-keep proposals may be generated.
+
+        ``joint_plan`` deliberately enables the stage-three proposal machinery
+        without enabling its independent rule-based ``decide`` path.
+        """
+
+        return self.mode in {"active_rule_based", "joint_plan"} and len(self.action_set) > 1
+
     def state_fingerprint(self) -> Tuple[Any, ...]:
         vehicle = self.sim.vehicle
         queue = tuple(
@@ -329,7 +339,7 @@ class ActiveCAVController:
         keep = GroundCandidate(self._next_id(), "keep_route", target_node=self.sim.vehicle.target_node)
         keep = self.evaluate_cav_candidate(keep)
         candidates = [keep]
-        if not self.active or not self.sim.vehicle.at_intersection:
+        if not self.candidate_generation_enabled or not self.sim.vehicle.at_intersection:
             return candidates
         if "wait" in self.action_set:
             wait_updates: Dict[str, int] = {}
@@ -418,6 +428,13 @@ class ActiveCAVController:
             )
             remaining_time += duration
             remaining_energy += duration * rate
+        if str(segments[-1].get("type")) != "fly":
+            origin = int(segments[-1].get("to", drone.position))
+            return_time = self.sim.network.get_drone_time(origin, int(recovery_node))
+            remaining_time += return_time
+            remaining_energy += return_time * float(
+                self.sim.cfg["agents"].get("drone_fly_power", 1.0)
+            )
         reserve = float(entry.get("battery_reserve", 0.0))
         battery_at_eta = float(drone.battery) - remaining_energy
         if battery_at_eta < reserve - 1e-9:
@@ -793,12 +810,24 @@ class ActiveCAVController:
             entry["battery_at_eta"] = float(prediction["battery_at_eta"])
             if drone.sortie is not None and drone.sortie.segments:
                 final = drone.sortie.segments[-1]
-                if str(final.get("type")) != "fly":
-                    return False
-                old_duration = float(final.get("duration", 0.0))
-                new_duration = self.sim.network.get_drone_time(int(final.get("from", drone.position)), int(node))
-                final["to"] = int(node)
-                final["duration"] = float(new_duration)
+                if str(final.get("type")) == "fly":
+                    old_duration = float(final.get("duration", 0.0))
+                    origin = int(final.get("from", drone.position))
+                    new_duration = self.sim.network.get_drone_time(origin, int(node))
+                    final["to"] = int(node)
+                    final["duration"] = float(new_duration)
+                else:
+                    old_duration = 0.0
+                    origin = int(final.get("to", drone.position))
+                    new_duration = self.sim.network.get_drone_time(origin, int(node))
+                    drone.sortie.segments.append(
+                        {
+                            "type": "fly",
+                            "from": origin,
+                            "to": int(node),
+                            "duration": float(new_duration),
+                        }
+                    )
                 drone.sortie.recovery_node = int(node)
                 drone.sortie.drone_time_s += float(new_duration - old_duration)
                 fly_power = float(self.sim.cfg["agents"].get("drone_fly_power", 1.0))
@@ -809,8 +838,12 @@ class ActiveCAVController:
             return True
         return False
 
-    def commit_cav_action(self, candidate: GroundCandidate) -> bool:
-        if not candidate.feasible or candidate.state_fingerprint != self.state_fingerprint():
+    def commit_cav_action(
+        self, candidate: GroundCandidate, *, validate_fingerprint: bool = True
+    ) -> bool:
+        if not candidate.feasible or (
+            validate_fingerprint and candidate.state_fingerprint != self.state_fingerprint()
+        ):
             return candidate.action_type == "keep_route" and candidate.feasible
         if candidate.action_type == "keep_route":
             self.sim._set_vehicle_next_recovery_target()

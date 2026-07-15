@@ -17,6 +17,7 @@ from .drone import Drone
 from .recovery_scheduler import RecoveryInsertionScheduler
 from .cav_controller import ActiveCAVController
 from dynamic_patrol_marl.planner.sortie_generator import Sortie, SortieGenerator
+from dynamic_patrol_marl.planner.joint_plan import JointPlanGenerator
 from dynamic_patrol_marl.utils.metrics import EpisodeMetrics, summarize_task_metrics
 
 
@@ -96,6 +97,11 @@ class Simulator:
         self.uav_return_time_s = 0.0
         self.uav_return_distance_m = 0.0
         self.ground_controller = ActiveCAVController(self)
+        inferred_mode = "separate_control" if self.ground_controller.mode == "active_rule_based" else "sortie_only"
+        self.decision_mode = str(cfg.get("decision_mode", inferred_mode)).lower()
+        if self.decision_mode not in {"sortie_only", "separate_control", "joint_plan"}:
+            raise ValueError(f"Unknown decision_mode: {self.decision_mode}")
+        self.joint_plan_generator = JointPlanGenerator(self) if self.decision_mode == "joint_plan" else None
 
     def reset(self) -> None:
         self.__init__(self.cfg, self.seed, self.scenario)
@@ -585,6 +591,7 @@ class Simulator:
         )
         num_sorties = len(self.sortie_log)
         avg_tasks_per_sortie = (sum(len(str(x.get("task_ids", [])).split(",")) if isinstance(x.get("task_ids"), str) else len(x.get("task_ids", [])) for x in self.sortie_log) / num_sorties) if num_sorties else 0.0
+        joint_summary = self.joint_plan_generator.summary() if self.joint_plan_generator is not None else {}
         m = EpisodeMetrics(
             seed=self.seed,
             method=method_name,
@@ -619,6 +626,7 @@ class Simulator:
             uav_return_distance_m=float(self.uav_return_distance_m),
             uav_return_time_s=float(self.uav_return_time_s),
             **self.ground_controller.summary(),
+            **joint_summary,
         )
         for k, v in base.items():
             setattr(m, k, v)
@@ -634,6 +642,10 @@ class Simulator:
         pd.DataFrame(self.vehicle.route_edge_log, columns=["time", "from_node", "to_node"]).to_csv(out / f"{prefix}_vehicle_edges.csv", index=False)
         pd.DataFrame(self.insertion_log).to_csv(out / f"{prefix}_recovery_insertions.csv", index=False)
         pd.DataFrame(self.ground_controller.action_log).to_csv(out / f"{prefix}_cav_actions.csv", index=False)
+        if self.joint_plan_generator is not None:
+            pd.DataFrame(self.joint_plan_generator.generation_log).to_csv(out / f"{prefix}_joint_plan_generation.csv", index=False)
+            pd.DataFrame(self.joint_plan_generator.rejection_log).to_csv(out / f"{prefix}_joint_plan_rejections.csv", index=False)
+            pd.DataFrame(self.joint_plan_generator.commit_log).to_csv(out / f"{prefix}_joint_plan_commits.csv", index=False)
         pd.DataFrame(self.ground_controller.candidate_log).to_csv(out / f"{prefix}_ground_candidates.csv", index=False)
         pd.DataFrame(self.ground_controller.route_change_log).to_csv(out / f"{prefix}_route_changes.csv", index=False)
         pd.DataFrame(self.ground_controller.recovery_schedule_log).to_csv(out / f"{prefix}_recovery_schedule.csv", index=False)

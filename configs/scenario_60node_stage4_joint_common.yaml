@@ -1,0 +1,46 @@
+base: scenario_60node_stage3_cav_common.yaml
+
+decision_mode: joint_plan
+
+cav_control:
+  mode: joint_plan
+  action_set: [keep_route, wait, move_to, reroute]
+  max_ground_candidates: 8
+
+joint_plan:
+  max_non_safe_plans: 24
+  max_ground_candidates: 4
+  max_sorties_per_ground: 6
+  max_insertions_per_pair: 1
+  type_quotas:
+    type_I: 12
+    type_II: 8
+    type_III: 4
+
+uav_return_guard:
+  enabled: true
+  max_return_distance_increase_ratio: 0.75
+  return_distance_floor_m: 100
+  enforce_energy_feasibility: true
+  minimum_battery_slack: 0
+  log_rejected_plans: true
+
+joint_plan_cost:
+  weight_task_benefit: 1.0
+  weight_uav_energy: 0.2
+  weight_uav_return: 0.4
+  weight_cav: 0.2
+  weight_recovery: 0.5
+  weight_stability: 0.2
+
+joint_plan_features:
+  distance_scale_m: 3600
+  time_scale_s: 600
+  energy_scale: 1800
+  task_scale: 10
+  clip_low: -5
+  clip_high: 5
+
+rl:
+  hyperparams:
+    candidate_dim: 38

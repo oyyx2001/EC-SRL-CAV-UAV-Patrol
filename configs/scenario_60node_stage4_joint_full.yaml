@@ -1,0 +1,4 @@
+base: scenario_60node_stage4_joint_common.yaml
+training:
+  run_name: stage4_joint_full
+  model_name: RainbowDQN_stage4_joint_full.pt

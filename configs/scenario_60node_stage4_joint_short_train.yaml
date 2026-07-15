@@ -1,0 +1,15 @@
+base: scenario_60node_stage4_joint_full.yaml
+training:
+  seed_mode: fixed
+  run_name: stage4_joint_short_train_seed0
+  model_name: RainbowDQN_stage4_joint_short_train_seed0.pt
+rl:
+  timesteps: 1000
+  eval_seeds: [1000]
+  hyperparams:
+    candidate_dim: 38
+    batch_size: 32
+    replay_buffer_size: 5000
+    learning_starts: 100
+    target_update_interval: 200
+    eval_interval: 1000

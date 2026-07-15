@@ -1,0 +1,4 @@
+base: scenario_60node_stage4_joint_full.yaml
+uav_return_guard:
+  enabled: true
+  max_return_distance_increase_ratio: 0.25

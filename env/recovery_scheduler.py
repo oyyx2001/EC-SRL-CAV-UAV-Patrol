@@ -160,6 +160,146 @@ class RecoveryInsertionScheduler:
             "state_fingerprint": state_fingerprint,
         }
 
+    def evaluate_insertions(
+        self,
+        sortie: Any,
+        ground_plan_override: Optional[Dict[str, Any]] = None,
+        max_results: int = 1,
+        commit: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return ranked feasible insertion alternatives without side effects.
+
+        The legacy :meth:`evaluate` result and tie-breaking remain unchanged.
+        A ground override may supply a trial ``queue`` and the physical
+        ``first_cav_arrival_time`` produced by a stage-three GroundCandidate.
+        Committing here is intentionally unsupported: stage four commits the
+        selected ground and air components in one atomic transaction.
+        """
+
+        if commit:
+            raise ValueError("ranked insertion evaluation is side-effect-free; commit the JointPlan")
+        max_results = max(0, int(max_results))
+        if max_results == 0:
+            return []
+        if ground_plan_override is None:
+            result = self.evaluate(sortie, rule="dynamic_insertion")
+            if not result.get("feasible", False):
+                return []
+            diagnostics = result.get("diagnostics", {})
+            append_index = int(diagnostics.get("append_index", len(self.sim.recovery_queue)))
+            feasible = [
+                option
+                for option in diagnostics.get("position_results", [])
+                if bool(option.get("feasible", False))
+            ]
+            feasible.sort(
+                key=lambda option: (
+                    round(float(option.get("cost", math.inf)), 12),
+                    round(float(option.get("cost_parts", {}).get("existing_delay", math.inf)), 12),
+                    append_index - int(option.get("index", append_index)),
+                    -int(option.get("index", append_index)),
+                    int(option.get("index", append_index)),
+                )
+            )
+            ranked: List[Dict[str, Any]] = []
+            for option in feasible[:max_results]:
+                ranked.append(
+                    {
+                        "feasible": True,
+                        "best_index": int(option["index"]),
+                        "insertion_cost": float(option["cost"]),
+                        "predicted_schedule": deepcopy(option["schedule"]),
+                        "diagnostics": {
+                            **diagnostics,
+                            "selected_index": int(option["index"]),
+                            "selected_cost": float(option["cost"]),
+                        },
+                        "entry": dict(result["entry"]),
+                        "state_fingerprint": result["state_fingerprint"],
+                    }
+                )
+            return ranked
+
+        started = perf_counter()
+        queue = [dict(entry) for entry in ground_plan_override.get("queue", self.sim.recovery_queue)]
+        new_entry = self.make_entry(sortie)
+        if any(
+            str(entry.get("drone_id", entry.get("uav_id"))) == str(sortie.drone_id)
+            for entry in queue
+        ):
+            return []
+        append_index = len(queue)
+        locked_prefix = self.locked_prefix_length(queue)
+        first_arrival = float(
+            ground_plan_override.get("first_cav_arrival_time", self.sim.now)
+        )
+        options: List[Dict[str, Any]] = []
+        append_queue = [dict(entry) for entry in queue] + [dict(new_entry)]
+        append_sim = self.simulate_ground_plan(append_queue, first_arrival)
+        append_parts = self._cost_parts(append_sim, append_sim, queue)
+        append_cost = self._weighted_cost(append_parts)
+        for index in range(locked_prefix, append_index + 1):
+            trial = [dict(entry) for entry in queue]
+            trial.insert(index, dict(new_entry))
+            simulated = self.simulate_ground_plan(trial, first_arrival)
+            if not simulated.get("feasible", False):
+                continue
+            parts = self._cost_parts(simulated, append_sim, queue)
+            options.append(
+                {
+                    "index": index,
+                    "cost": self._weighted_cost(parts),
+                    "cost_parts": parts,
+                    "schedule": simulated["schedule"],
+                }
+            )
+        options.sort(
+            key=lambda option: (
+                round(float(option["cost"]), 12),
+                round(float(option["cost_parts"]["existing_delay"]), 12),
+                append_index - int(option["index"]),
+                -int(option["index"]),
+                int(option["index"]),
+            )
+        )
+        ranked = []
+        for option in options[:max_results]:
+            selected_index = int(option["index"])
+            schedule = deepcopy(option["schedule"])
+            new_row = next(row for row in schedule if row["sortie_id"] == new_entry["sortie_id"])
+            ranked.append(
+                {
+                    "feasible": True,
+                    "best_index": selected_index,
+                    "insertion_cost": float(option["cost"]),
+                    "predicted_schedule": schedule,
+                    "diagnostics": {
+                        "queue_length_before": len(queue),
+                        "locked_prefix_length": locked_prefix,
+                        "feasible_insertion_count": len(options),
+                        "append_index": append_index,
+                        "selected_index": selected_index,
+                        "insertion_displacement": append_index - selected_index,
+                        "selected_cost": float(option["cost"]),
+                        "append_cost": float(append_cost),
+                        "counterfactual_gain": float(append_cost - option["cost"]),
+                        "predicted_new_uav_wait": float(new_row["predicted_uav_wait"]),
+                        "predicted_total_uav_wait": float(option["cost_parts"]["total_uav_wait"]),
+                        "predicted_existing_delay": float(option["cost_parts"]["existing_delay"]),
+                        "predicted_cav_wait": float(option["cost_parts"]["total_cav_wait"]),
+                        "predicted_route_time_change": float(option["cost_parts"]["route_time_change"]),
+                        "predicted_hover_energy": float(option["cost_parts"]["hover_energy"]),
+                        "selected_is_non_append": selected_index < append_index,
+                        "insertion_feasible": True,
+                        "fallback_reason": "ground_plan_override",
+                        "computation_time_ms": (perf_counter() - started) * 1000.0,
+                    },
+                    "entry": dict(new_entry),
+                    "state_fingerprint": self.state_fingerprint(),
+                }
+            )
+        return ranked
+
     def simulate(self, queue: Sequence[Dict[str, Any]], new_sortie_id: Optional[str] = None) -> Dict[str, Any]:
         schedule: List[Dict[str, Any]] = []
         current_time = float(self.sim.now)

@@ -154,6 +154,11 @@ def _load_masked_dqn(
         "action_masking": bool(checkpoint.get("action_masking", action_masking)),
         "replay_config": replay_config,
         "legacy_fixed_interval_checkpoint": int(replay_config.get("schema_version", 1)) < 2,
+        "obs_dim": obs_dim,
+        "action_dim": action_dim,
+        "candidate_dim": candidate_dim,
+        "decision_mode": str(checkpoint.get("decision_mode", "sortie_only")),
+        "feature_schema": checkpoint.get("feature_schema", {}) or {},
     }
 
 
@@ -209,6 +214,16 @@ def _evaluate_spec(
     for seed in seeds:
         env = DynamicPatrolEnv(cfg, scenario=scenario)
         obs, info = _reset_env(env, int(seed))
+        if spec.family == "dqn" and (
+            int(model["obs_dim"]) != int(env.observation_space.shape[0])
+            or int(model["action_dim"]) != int(env.action_space.n)
+        ):
+            raise ValueError(
+                "checkpoint/environment dimension mismatch: "
+                f"checkpoint obs={model['obs_dim']} action={model['action_dim']}, "
+                f"environment obs={env.observation_space.shape[0]} action={env.action_space.n}; "
+                "legacy sortie-only checkpoints cannot be loaded into joint_plan mode"
+            )
         done = False
         episode_reward = 0.0
         while not done:

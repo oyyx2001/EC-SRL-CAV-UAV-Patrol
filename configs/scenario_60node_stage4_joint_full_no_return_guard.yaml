@@ -1,0 +1,3 @@
+base: scenario_60node_stage4_joint_full.yaml
+uav_return_guard:
+  enabled: false
