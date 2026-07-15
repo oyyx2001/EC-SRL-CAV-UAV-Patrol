@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -125,6 +126,15 @@ def _load_masked_dqn(
         action_dim = int(checkpoint["action_dim"])
         candidate_dim = int(checkpoint.get("candidate_dim", hyperparams.get("candidate_dim", 6)))
         state_dict = checkpoint["model_state_dict"]
+        replay_config = checkpoint.get("replay_config", {}) or {}
+        if int(replay_config.get("schema_version", 1)) < 2:
+            warnings.warn(
+                "Loading a legacy fixed-interval checkpoint without SMDP replay metadata. "
+                "It may be used for an event-driven smoke test only; decision-frequency "
+                "and state-distribution shift make it unsuitable as a final performance result.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     else:
         raise ValueError(
             f"{model_path} is not a supported Masked DQN checkpoint. "
@@ -142,6 +152,8 @@ def _load_masked_dqn(
         "device": device,
         "masked_q_values": masked_q_values,
         "action_masking": bool(checkpoint.get("action_masking", action_masking)),
+        "replay_config": replay_config,
+        "legacy_fixed_interval_checkpoint": int(replay_config.get("schema_version", 1)) < 2,
     }
 
 

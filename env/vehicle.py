@@ -38,6 +38,7 @@ class Vehicle:
     wait_time: float = 0.0
     distance_time: float = 0.0
     last_arrival_time: Optional[float] = None
+    schedule_version: int = 0
 
     def is_idle(self) -> bool:
         return self.target_node is None or self.remaining_time <= 1e-9
@@ -45,6 +46,7 @@ class Vehicle:
     def set_target(self, target: int, network: RoadNetwork, now: float) -> None:
         """Set a new CAV target and expand the directed shortest path to it."""
         target = int(target)
+        self.schedule_version += 1
         self.last_arrival_time = None
 
         if target == self.position:

@@ -21,6 +21,12 @@ from dynamic_patrol_marl.rl.dqn_networks import make_q_network, masked_q_values,
 from dynamic_patrol_marl.rl.env_wrapper import DynamicPatrolEnv
 from dynamic_patrol_marl.rl.paths import resolve_dqn_output_dirs
 from dynamic_patrol_marl.rl.replay_buffer import MaskedReplayBuffer, PrioritizedMaskedReplayBuffer
+from dynamic_patrol_marl.rl.smdp import (
+    NStepSMDPAccumulator,
+    NStepTransition,
+    one_step_smdp_target,
+    td_error_delta_t_bin,
+)
 from dynamic_patrol_marl.rl.seed_scheduler import (
     CurriculumSeedScheduler,
     SEED_MODES,
@@ -53,6 +59,7 @@ class DQNHyperParams:
     batch_size: int = 128
     replay_buffer_size: int = 100000
     learning_starts: int = 5000
+    train_frequency: int = 1
     target_update_interval: int = 2000
     epsilon_start: float = 1.0
     epsilon_final: float = 0.05
@@ -86,15 +93,21 @@ def reset_env(env: DynamicPatrolEnv, seed: int | None = None) -> Tuple[np.ndarra
     return np.asarray(obs, dtype=np.float32), np.asarray(mask, dtype=bool)
 
 
-def step_env(env: DynamicPatrolEnv, action: int) -> Tuple[np.ndarray, float, bool, np.ndarray]:
+def step_env(env: DynamicPatrolEnv, action: int) -> Tuple[np.ndarray, float, bool, np.ndarray, Dict]:
     out = env.step(int(action))
     if len(out) == 5:
         obs, reward, terminated, truncated, info = out
         done = bool(terminated or truncated)
+        info = dict(info)
+        info["terminated"] = bool(terminated)
+        info["truncated"] = bool(truncated)
     else:
         obs, reward, done, info = out
     mask = info.get("action_mask", env.action_masks())
-    return np.asarray(obs, dtype=np.float32), float(reward), bool(done), np.asarray(mask, dtype=bool)
+    info = dict(info)
+    info.setdefault("terminated", bool(done))
+    info.setdefault("truncated", False)
+    return np.asarray(obs, dtype=np.float32), float(reward), bool(done), np.asarray(mask, dtype=bool), info
 
 
 def epsilon_by_step(step: int, hp: DQNHyperParams) -> float:
@@ -165,7 +178,10 @@ def compute_dqn_loss(
             next_actions = masked_q_values(online_next_q, next_action_masks).argmax(dim=1)
             target_next_q = target_net(batch.next_obs, next_action_masks)
             next_q = target_next_q.gather(1, next_actions.unsqueeze(1)).squeeze(1)
-        target_q = batch.rewards + float(gamma) * (1.0 - batch.dones) * next_q
+        discounts = getattr(batch, "bootstrap_discounts", None)
+        if discounts is None:
+            discounts = torch.full_like(batch.rewards, float(gamma))
+        target_q = one_step_smdp_target(batch.rewards, discounts, batch.dones, next_q)
     per_sample_loss = nn.functional.smooth_l1_loss(current_q, target_q, reduction="none")
     if weights is not None:
         per_sample_loss = per_sample_loss * weights
@@ -261,7 +277,7 @@ def evaluate_policy(
                 rng=rng,
                 device=device,
             )
-            obs, reward, done, mask = step_env(env, action)
+            obs, reward, done, mask, _ = step_env(env, action)
             episode_reward += reward
         rows.append(metric_row(step, algo, int(seed), env.sim.metrics(method_name).to_dict(), episode_reward))
     q_network.train()
@@ -288,6 +304,7 @@ def save_outputs(
     seed_mode: str,
     stages: List[Dict],
     action_masking: bool,
+    replay_config: Dict | None = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -309,6 +326,7 @@ def save_outputs(
             "obs_dim": int(obs_dim),
             "action_dim": int(action_dim),
             "candidate_dim": int(hp.candidate_dim),
+            "replay_config": dict(replay_config or {}),
             "model_state_dict": online_net.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
         },
@@ -333,6 +351,8 @@ def save_outputs(
         "action_masking": bool(action_masking),
         "mask_mode": "masked" if action_masking else "unmasked",
         "training_stages": json.dumps(stages),
+        "replay_schema_version": int((replay_config or {}).get("schema_version", 1)),
+        "time_mode": str((replay_config or {}).get("time_mode", "fixed_interval")),
         **asdict(hp),
     }
     if not final_eval.empty:
@@ -421,6 +441,16 @@ def train_masked_dqn(
     target_net.load_state_dict(online_net.state_dict())
     target_net.eval()
     optimizer = torch.optim.Adam(online_net.parameters(), lr=hp.lr)
+    time_mode = str(cfg.get("time", {}).get("mode", cfg.get("time_mode", "fixed_interval"))).lower()
+    smdp_cfg = cfg.get("smdp", {})
+    reference_interval_s = float(smdp_cfg.get("reference_interval_s", 60.0))
+    n_step = int(smdp_cfg.get("n_step", 1))
+    n_step_accumulator = NStepSMDPAccumulator(n_step)
+    replay_kwargs = {
+        "default_transition_discount": float(hp.gamma),
+        "time_mode": time_mode,
+        "require_time_fields": time_mode == "event_driven",
+    }
     if algo == "rainbow_dqn":
         replay = PrioritizedMaskedReplayBuffer(
             hp.replay_buffer_size,
@@ -429,9 +459,16 @@ def train_masked_dqn(
             seed=base_seed,
             alpha=hp.prioritized_replay_alpha,
             priority_epsilon=hp.priority_epsilon,
+            **replay_kwargs,
         )
     else:
-        replay = MaskedReplayBuffer(hp.replay_buffer_size, obs_dim, action_dim, seed=base_seed)
+        replay = MaskedReplayBuffer(
+            hp.replay_buffer_size,
+            obs_dim,
+            action_dim,
+            seed=base_seed,
+            **replay_kwargs,
+        )
 
     training_rows: List[Dict] = []
     eval_rows: List[Dict] = []
@@ -439,6 +476,14 @@ def train_masked_dqn(
     episode_steps = 0
     episode_idx = 0
     latest_loss = np.nan
+    gradient_updates = 0
+    training_simulated_seconds = 0.0
+    td_error_diagnostics: Dict[str, List[float]] = {
+        "delta_0_30": [],
+        "delta_30_60": [],
+        "delta_60_120": [],
+        "delta_over_120": [],
+    }
     stage_end_steps = np.cumsum([int(stage.timesteps) for stage in stages]).tolist()
     current_stage_idx = 0
     scheduler.set_stage(current_stage_idx)
@@ -462,23 +507,57 @@ def train_masked_dqn(
             reset_noisy_layers(online_net)
         stored_mask = policy_action_mask(mask, action_masking)
         action = select_action(online_net, obs, stored_mask, epsilon, rng, device)
-        next_obs, reward, done, next_mask = step_env(env, action)
-        replay.add(
-            obs,
-            action,
-            reward,
-            next_obs,
-            done,
-            stored_mask,
-            policy_action_mask(next_mask, action_masking),
+        next_obs, reward, done, next_mask, transition_info = step_env(env, action)
+        if time_mode == "event_driven":
+            delta_t = float(transition_info["delta_t"])
+            bootstrap_discount = float(transition_info["transition_discount"])
+        else:
+            delta_t = reference_interval_s
+            bootstrap_discount = float(hp.gamma)
+        training_simulated_seconds += float(transition_info.get("delta_t", delta_t))
+        raw_transition = NStepTransition(
+            obs=np.asarray(obs, dtype=np.float32),
+            action=int(action),
+            reward=float(reward),
+            next_obs=np.asarray(next_obs, dtype=np.float32),
+            terminated=bool(transition_info.get("terminated", done)),
+            truncated=bool(transition_info.get("truncated", False)),
+            action_mask=np.asarray(stored_mask, dtype=bool),
+            next_action_mask=np.asarray(policy_action_mask(next_mask, action_masking), dtype=bool),
+            delta_t=delta_t,
+            bootstrap_discount=bootstrap_discount,
+            decision_time=float(transition_info.get("decision_time", 0.0)),
+            trigger_event_type="|".join(transition_info.get("trigger_events", [])),
+            instantaneous_dispatch=bool(transition_info.get("instantaneous_dispatch", False)),
         )
+        for stored_transition in n_step_accumulator.append(raw_transition):
+            replay.add(
+                stored_transition.obs,
+                stored_transition.action,
+                stored_transition.reward,
+                stored_transition.next_obs,
+                stored_transition.done,
+                stored_transition.action_mask,
+                stored_transition.next_action_mask,
+                terminated=stored_transition.terminated,
+                truncated=stored_transition.truncated,
+                delta_t=stored_transition.delta_t,
+                transition_discount=stored_transition.bootstrap_discount,
+                decision_time=stored_transition.decision_time,
+                trigger_event_type=stored_transition.trigger_event_type,
+                instantaneous_dispatch=stored_transition.instantaneous_dispatch,
+            )
 
         obs = next_obs
         mask = next_mask
         episode_reward += reward
         episode_steps += 1
 
-        if step >= hp.learning_starts and len(replay) >= hp.batch_size:
+        if (
+            step >= hp.learning_starts
+            and len(replay) >= hp.batch_size
+            and step % max(1, int(hp.train_frequency)) == 0
+        ):
             if algo == "rainbow_dqn":
                 reset_noisy_layers(online_net)
                 batch = replay.sample(hp.batch_size, device, beta=prioritized_beta_by_step(step, hp))
@@ -498,8 +577,14 @@ def train_masked_dqn(
             loss.backward()
             nn.utils.clip_grad_norm_(online_net.parameters(), hp.max_grad_norm)
             optimizer.step()
+            gradient_updates += 1
             if algo == "rainbow_dqn" and batch.indices is not None:
                 replay.update_priorities(batch.indices, td_errors)
+            for duration, error in zip(
+                batch.delta_ts.detach().cpu().numpy(),
+                td_errors.detach().abs().cpu().numpy(),
+            ):
+                td_error_diagnostics[td_error_delta_t_bin(float(duration))].append(float(error))
             latest_loss = float(loss.item())
 
         if step % hp.target_update_interval == 0:
@@ -520,6 +605,11 @@ def train_masked_dqn(
                 stage_name=stages[current_stage_idx].name,
             )
             training_rows.append(row)
+            row["simulated_time_s"] = float(env.sim.now)
+            row["decisions_per_episode"] = int(getattr(env, "decision_index", episode_steps))
+            row["gradient_updates"] = int(gradient_updates)
+            row["replay_transitions"] = int(len(replay))
+            row["training_simulated_seconds"] = float(training_simulated_seconds)
             if writer is not None:
                 write_train_scalars(writer, row, step)
             episode_idx += 1
@@ -595,7 +685,38 @@ def train_masked_dqn(
             for stage in stages
         ],
         action_masking=action_masking,
+        replay_config={
+            **replay.state_dict(),
+            "n_step": n_step,
+            "reference_interval_s": reference_interval_s,
+            "gamma_reference": float(hp.gamma),
+            "discount_mode": str(smdp_cfg.get("discount_mode", "fixed_decision")),
+        },
     )
+    pd.DataFrame(
+        [
+            {
+                "delta_t_bin": key,
+                "mean_td_error": float(np.mean(values)) if values else np.nan,
+                "sample_count": len(values),
+            }
+            for key, values in td_error_diagnostics.items()
+        ]
+    ).to_csv(run_dir / "td_error_by_delta_t.csv", index=False)
+    with open(run_dir / "replay_config.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                **replay.state_dict(),
+                "n_step": n_step,
+                "reference_interval_s": reference_interval_s,
+                "gamma_reference": float(hp.gamma),
+                "discount_mode": str(smdp_cfg.get("discount_mode", "fixed_decision")),
+                "gradient_updates": gradient_updates,
+                "training_simulated_seconds": training_simulated_seconds,
+            },
+            f,
+            indent=2,
+        )
     if writer is not None:
         writer.flush()
         writer.close()
@@ -654,6 +775,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--replay-buffer-size", type=int, default=None)
     parser.add_argument("--learning-starts", type=int, default=None)
+    parser.add_argument("--train-frequency", type=int, default=None)
     parser.add_argument("--target-update-interval", type=int, default=None)
     parser.add_argument("--epsilon-start", type=float, default=None)
     parser.add_argument("--epsilon-final", type=float, default=None)

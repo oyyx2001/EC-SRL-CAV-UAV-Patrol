@@ -60,9 +60,15 @@ class Simulator:
         self.horizon = float(cfg["simulation"].get("horizon_s", 3600))
         self.dt = float(cfg["simulation"].get("dt_s", 10))
         self.decision_interval = float(cfg["simulation"].get("decision_interval_s", 60))
+        time_cfg = cfg.get("time", {})
+        self.time_mode = str(time_cfg.get("mode", cfg.get("time_mode", "fixed_interval"))).lower()
+        if self.time_mode not in {"fixed_interval", "event_driven"}:
+            raise ValueError(f"Unknown time mode: {self.time_mode}")
+        self.event_driven = self.time_mode == "event_driven"
         self.event_log: List[Dict[str, Any]] = []
         self.sortie_log: List[Dict[str, Any]] = []
         self.recovery_queue: List[Dict[str, Any]] = []
+        self.recovery_schedule_version = 0
         recovery_cfg = cfg.get("recovery", {})
         self.recovery_rule = str(recovery_cfg.get("rule", cfg.get("recovery_rule", "fifo"))).lower()
         if self.recovery_rule not in {"fifo", "dynamic_insertion"}:
@@ -153,6 +159,9 @@ class Simulator:
             return False
         entry = dict(evaluation["entry"])
         self.recovery_queue.insert(index, entry)
+        # The flexible queue has its own version.  It must not invalidate the
+        # CAV's already locked current-edge arrival event.
+        self.recovery_schedule_version += 1
         schedule_by_id = {str(row["sortie_id"]): row for row in evaluation["predicted_schedule"]}
         for queue_entry in self.recovery_queue:
             row = schedule_by_id.get(str(queue_entry.get("sortie_id")))
@@ -250,6 +259,7 @@ class Simulator:
     def _append_fifo_entry(self, sortie: Sortie, evaluation: Dict[str, Any]) -> None:
         entry = evaluation.get("entry") or self.recovery_scheduler.make_entry(sortie)
         self.recovery_queue.append(dict(entry))
+        self.recovery_schedule_version += 1
         if evaluation.get("predicted_schedule"):
             schedule_by_id = {str(row["sortie_id"]): row for row in evaluation["predicted_schedule"]}
             for queue_entry in self.recovery_queue:
@@ -309,12 +319,13 @@ class Simulator:
             self._advance_drone(drone, dt, start)
         for arrival_time, node in self.last_step_vehicle_arrivals:
             self.event_log.append({"time": arrival_time, "event": "vehicle_arrive", "agent": self.vehicle.id, "node": node, "tasks": ""})
+        event_time = start + dt if self.event_driven else self.now
         if arrived:
-            self._recover_waiting_drones()
+            self._recover_waiting_drones(event_time)
         # Recover if vehicle is already at a waiting drone's recovery point.
-        self._recover_waiting_drones()
+        self._recover_waiting_drones(event_time)
         if self.vehicle.is_idle():
-            self._set_vehicle_next_recovery_target()
+            self._set_vehicle_next_recovery_target(event_time)
         self.now += dt
         self.task_pool.update_release_and_expiry(self.now)
 
@@ -396,7 +407,7 @@ class Simulator:
             drone.log.append((t, "waiting_recovery", rec))
             self.event_log.append({"time": t, "event": "drone_wait_recovery", "agent": drone.id, "node": rec, "tasks": ""})
 
-    def _recover_waiting_drones(self) -> None:
+    def _recover_waiting_drones(self, event_time: Optional[float] = None) -> None:
         if not self.recovery_queue or not self.vehicle.is_idle():
             return
         front = self.recovery_queue[0]
@@ -404,7 +415,7 @@ class Simulator:
         rec = int(front["recovery_node"])
         if drone.status == "waiting_recovery" and drone.position == self.vehicle.position == rec:
             front["status"] = "recovering"
-            self._recover_drone(drone, self.now)
+            self._recover_drone(drone, self.now if event_time is None else float(event_time))
 
     def _recover_drone(self, drone: Drone, t: float) -> None:
         rec = drone.position
@@ -417,6 +428,7 @@ class Simulator:
         drone.reset_after_recovery(rec, t)
         if self.recovery_queue and str(self.recovery_queue[0]["drone_id"]) == drone.id:
             finished = self.recovery_queue.pop(0)
+            self.recovery_schedule_version += 1
             self.event_log.append(
                 {
                     "time": t,
@@ -429,7 +441,7 @@ class Simulator:
         self.event_log.append({"time": t, "event": "recover", "agent": drone.id, "node": rec, "tasks": ""})
         self._sync_idle_drones_with_vehicle()
 
-    def _set_vehicle_next_recovery_target(self) -> None:
+    def _set_vehicle_next_recovery_target(self, event_time: Optional[float] = None) -> None:
         if not self.vehicle.is_idle():
             return
         if not self.recovery_queue:
@@ -437,8 +449,9 @@ class Simulator:
         target = int(self.recovery_queue[0]["recovery_node"])
         if target == self.vehicle.position:
             return
-        self.vehicle.set_target(target, self.network, self.now)
-        self.event_log.append({"time": self.now, "event": "vehicle_depart", "agent": self.vehicle.id, "node": self.vehicle.position, "target": target, "tasks": ""})
+        timestamp = self.now if event_time is None else float(event_time)
+        self.vehicle.set_target(target, self.network, timestamp)
+        self.event_log.append({"time": timestamp, "event": "vehicle_depart", "agent": self.vehicle.id, "node": self.vehicle.position, "target": target, "tasks": ""})
 
     def _sync_idle_drones_with_vehicle(self) -> None:
         for drone in self.drones:
@@ -485,8 +498,21 @@ class Simulator:
         for arc in self.network.arcs:
             risk = self.network.arc_risk(arc)
             last = self.cover_last_time.get(arc, 0.0)
-            total += risk * max(0.0, self.now - last)
-        self.aoi_integral += (total / max(1, len(self.network.arcs))) * dt
+            age_start = max(0.0, self.now - last)
+            if self.event_driven:
+                total += risk * (age_start * dt + 0.5 * dt * dt)
+            else:
+                total += risk * age_start * dt
+        if self.event_driven:
+            self.aoi_integral += total / max(1, len(self.network.arcs))
+        else:
+            self.aoi_integral += total / max(1, len(self.network.arcs))
+
+    @staticmethod
+    def integrate_linear_rate(start_value: float, end_value: float, delta_t: float) -> float:
+        """Exact trapezoidal integral used by SMDP reward/AoI tests."""
+
+        return 0.5 * (float(start_value) + float(end_value)) * float(delta_t)
 
     def _all_terminal(self) -> bool:
         if any(d.status != "idle" for d in self.drones):

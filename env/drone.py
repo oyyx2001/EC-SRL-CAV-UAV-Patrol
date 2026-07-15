@@ -21,11 +21,13 @@ class Drone:
     energy_used: float = 0.0
     completed_task_ids: List[int] = field(default_factory=list)
     log: List[Tuple[float, str, int]] = field(default_factory=list)
+    schedule_version: int = 0
 
     def is_idle(self) -> bool:
         return self.status == "idle"
 
     def reset_after_recovery(self, node: int, now: float) -> None:
+        self.schedule_version += 1
         self.position = int(node)
         self.battery = self.battery_capacity
         self.status = "idle"
@@ -37,6 +39,7 @@ class Drone:
     def assign_sortie(self, sortie: Any, now: float) -> None:
         if not self.is_idle():
             raise ValueError(f"Drone {self.id} is not idle")
+        self.schedule_version += 1
         self.sortie = sortie
         self.status = "flying"
         self.segment_index = 0
