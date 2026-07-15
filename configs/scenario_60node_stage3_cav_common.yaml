@@ -1,0 +1,52 @@
+base: scenario_60node_stage2_event_dynamic.yaml
+
+# Stage 3 changes only the independent ground controller.  The UAV sortie
+# generator, 25-action Rainbow interface, reward, and SMDP discount are inherited.
+cav_control:
+  mode: passive
+  action_set: [keep_route]
+  decision_events:
+    - INITIAL_DECISION
+    - CAV_NODE_ARRIVAL
+    - CAV_RECOVERY_NODE_ARRIVAL
+    - CAV_RECOVERY_COMPLETE
+    - CAV_WAIT_COMPLETE
+    - UAV_SERVICE_COMPLETE
+    - UAV_RECOVERY_ARRIVAL
+    - UAV_RETURN_STARTED
+    - UAV_RECOVERED
+    - RECOVERY_QUEUE_UPDATED
+    - DYNAMIC_RECOVERY_INSERTION_COMPLETE
+    - UAV_ETA_UPDATED
+    - TASK_RELEASE
+  prediction_horizon_s: 300
+  max_ground_candidates: 8
+  max_rendezvous_nodes_per_uav: 3
+  max_wait_s: 120
+  max_detour_time_s: 120
+  max_detour_distance_m: 1000
+  max_detour_ratio: 0.25
+  minimum_recovery_slack_s: 30
+  maximum_uav_wait_s: 300
+  allow_flexible_rendezvous_update: true
+  preserve_locked_recovery: true
+  evaluate_without_side_effects: true
+  min_relative_improvement: 0.05
+  min_absolute_improvement: 0.0
+  task_distance_reference_m: 3600
+
+route_commitment:
+  enabled: true
+  minimum_commitment_nodes: 1
+  reroute_cooldown_s: 120
+  commitment_horizon_s: 180
+  prevent_immediate_reverse: true
+  max_route_changes_in_horizon: 2
+
+ground_cost:
+  weight_recovery_wait: 1.00
+  weight_uav_return: 0.50
+  weight_cav_wait: 0.25
+  weight_detour: 0.30
+  weight_task_coverage: 0.20
+  weight_route_switch: 0.20

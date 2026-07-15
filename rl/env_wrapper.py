@@ -98,6 +98,7 @@ class DynamicPatrolEnv(BaseEnv):
         self._dynamic_event_signatures: Dict[str, Tuple[int, float, str]] = {}
         self._delta_t_history: List[float] = []
         self._discount_history: List[float] = []
+        self._pending_ground_trigger_events: List[str] = ["INITIAL_DECISION"]
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict] = None):
         if self.seed_scheduler is not None:
@@ -124,6 +125,7 @@ class DynamicPatrolEnv(BaseEnv):
         self._dynamic_event_signatures = {}
         self._delta_t_history = []
         self._discount_history = []
+        self._pending_ground_trigger_events = ["INITIAL_DECISION"]
         if self.time_mode == "event_driven":
             self._initialize_event_queue()
         self.candidates = self.sim.get_candidates(no_multitask=self.no_multitask, no_priority=self.no_priority)
@@ -304,7 +306,15 @@ class DynamicPatrolEnv(BaseEnv):
             return
         tolerance = self.event_queue.time_tolerance
         vehicle = self.sim.vehicle
-        if vehicle.target_node is not None and vehicle.edge_remaining_time > tolerance:
+        if vehicle.is_waiting(self.sim.now):
+            self._schedule_entity_event(
+                vehicle.id,
+                vehicle.schedule_version,
+                float(vehicle.wait_until),
+                "CAV_WAIT_COMPLETE",
+                {"node": int(vehicle.position)},
+            )
+        elif vehicle.target_node is not None and vehicle.edge_remaining_time > tolerance:
             reaches_recovery = vehicle.edge_remaining_time >= vehicle.remaining_time - tolerance
             event_type = "CAV_RECOVERY_NODE_ARRIVAL" if reaches_recovery else "CAV_NODE_ARRIVAL"
             next_node = (
@@ -465,6 +475,22 @@ class DynamicPatrolEnv(BaseEnv):
             and self._instantaneous_count < max(1, max_instantaneous)
         )
 
+        ground_action = None
+        if launched > 0:
+            self._pending_ground_trigger_events.extend(
+                ["UAV_LAUNCH", "RECOVERY_QUEUE_UPDATED", "DYNAMIC_RECOVERY_INSERTION_COMPLETE"]
+            )
+        if not instantaneous_dispatch:
+            next_ground_event = self.event_queue.peek_time(self.sim.now, self._event_version)
+            ground_action = self.sim.ground_controller.decide(
+                list(dict.fromkeys(self._pending_ground_trigger_events)),
+                next_event_time=next_ground_event,
+            )
+            self._pending_ground_trigger_events = []
+            self.candidates = self.sim.get_candidates(
+                no_multitask=self.no_multitask, no_priority=self.no_priority
+            )
+
         if instantaneous_dispatch:
             self.instantaneous_decisions += 1
             self._schedule_dynamic_events()
@@ -485,6 +511,11 @@ class DynamicPatrolEnv(BaseEnv):
                 event_log_start = len(self.sim.event_log)
                 if next_time > self.sim.now + self.event_queue.time_tolerance:
                     self.sim.step(next_time - self.sim.now)
+                else:
+                    # Complete zero-duration physical segments represented by
+                    # an event at the current timestamp.  Without this flush,
+                    # the same dynamic event is immediately scheduled again.
+                    self.sim.step(0.0)
                 derived_map = {
                     "task_done": "TASK_SERVICE_COMPLETE",
                     "recover": "UAV_RECOVERED",
@@ -498,10 +529,30 @@ class DynamicPatrolEnv(BaseEnv):
                         if mapped is not None:
                             batch_types.append(mapped)
                 batch_types = list(dict.fromkeys(batch_types))
+                self._pending_ground_trigger_events.extend(batch_types)
+                if any(
+                    event_type in {"UAV_RECOVERED", "CAV_RECOVERY_COMPLETE"}
+                    for event_type in batch_types
+                ):
+                    self._pending_ground_trigger_events.append("RECOVERY_QUEUE_UPDATED")
                 state_after = self._state_summary()
                 self.candidates = self.sim.get_candidates(no_multitask=self.no_multitask, no_priority=self.no_priority)
                 next_mask_for_decision = self.action_masks()
                 decision_triggered = bool(next_mask_for_decision[1:].any()) and not self._episode_terminated()
+                if not decision_triggered and not self._episode_terminated():
+                    next_ground_event = self.event_queue.peek_time(self.sim.now, self._event_version)
+                    automatic_ground_action = self.sim.ground_controller.decide(
+                        list(dict.fromkeys(self._pending_ground_trigger_events)),
+                        next_event_time=next_ground_event,
+                    )
+                    if automatic_ground_action is not None:
+                        ground_action = automatic_ground_action
+                    self._pending_ground_trigger_events = []
+                    self.candidates = self.sim.get_candidates(
+                        no_multitask=self.no_multitask, no_priority=self.no_priority
+                    )
+                    next_mask_for_decision = self.action_masks()
+                    decision_triggered = bool(next_mask_for_decision[1:].any()) and not self._episode_terminated()
                 for event_type in batch_types or ["STATE_ADVANCE"]:
                     self.event_timeline.append(
                         {
@@ -573,6 +624,7 @@ class DynamicPatrolEnv(BaseEnv):
             "instantaneous_decision_count": int(self._instantaneous_count),
             "selected_sortie_id": selected_sortie_id,
             "action_type": action_type,
+            "ground_action": None if ground_action is None else ground_action.action_type,
             "recovery_queue_len": len(self.sim.recovery_queue),
             "wall_clock_step_time_ms": wall_ms,
             **self.sim.metrics("rl_env").to_dict(),
@@ -586,6 +638,7 @@ class DynamicPatrolEnv(BaseEnv):
             "transition_discount": discount,
             "action": int(action),
             "action_type": action_type,
+            "ground_action": None if ground_action is None else ground_action.action_type,
             "selected_sortie_id": selected_sortie_id,
             "trigger_events": "|".join(trigger_events),
             "processed_event_count": int(processed_event_count),

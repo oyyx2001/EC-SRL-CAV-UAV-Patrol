@@ -125,8 +125,20 @@ class TaskGenerator:
             return []
         releases = sorted(self.rng.uniform(0, horizon * 0.92, size=n).tolist())
         tasks: List[Task] = []
-        risk_arcs = self.network.high_risk_arcs()
-        weights = np.array([self.network.arc_risk(e) + 0.05 for e in risk_arcs], dtype=float)
+        concentration = str(self.task_cfg.get("spatial_concentration", "medium")).lower()
+        if concentration == "low":
+            # Uniform spatial support; task count and arrival process are unchanged.
+            risk_arcs = sorted(self.network.arcs)
+            weights = np.ones(len(risk_arcs), dtype=float)
+        elif concentration == "high":
+            all_arcs = self.network.high_risk_arcs()
+            fraction = float(self.task_cfg.get("hotspot_fraction", 0.12))
+            hotspot_count = max(1, int(math.ceil(len(all_arcs) * fraction)))
+            risk_arcs = all_arcs[:hotspot_count]
+            weights = np.array([self.network.arc_risk(e) + 0.05 for e in risk_arcs], dtype=float)
+        else:
+            risk_arcs = self.network.high_risk_arcs()
+            weights = np.array([self.network.arc_risk(e) + 0.05 for e in risk_arcs], dtype=float)
         weights = weights / weights.sum()
         for rel in releases:
             arc = risk_arcs[int(self.rng.choice(len(risk_arcs), p=weights))]

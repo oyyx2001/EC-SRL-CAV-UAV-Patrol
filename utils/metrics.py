@@ -44,6 +44,27 @@ class EpisodeMetrics:
     recovery_attempts: int = 0
     infeasible_recoveries: int = 0
     minimum_battery_observed: float = 0.0
+    cav_detour_distance_m: float = 0.0
+    cav_detour_ratio: float = 0.0
+    cav_waiting_time_s: float = 0.0
+    uav_return_distance_m: float = 0.0
+    uav_return_time_s: float = 0.0
+    minimum_recovery_slack_s: float = math.inf
+    maximum_queue_wait_s: float = 0.0
+    keep_route_count: int = 0
+    wait_count: int = 0
+    move_to_count: int = 0
+    reroute_count: int = 0
+    non_keep_action_rate: float = 0.0
+    route_change_count: int = 0
+    route_reversal_count: int = 0
+    emergency_override_count: int = 0
+    mean_route_commitment_time_s: float = 0.0
+    ground_candidate_count: float = 0.0
+    ground_action_computation_time_ms: float = 0.0
+    mean_predicted_gain_vs_keep: float = 0.0
+    mean_realized_gain_vs_keep: float = 0.0
+    maximum_cav_detour_ratio: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

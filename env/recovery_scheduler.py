@@ -216,6 +216,83 @@ class RecoveryInsertionScheduler:
 
         return {"feasible": True, "reason": "ok", "schedule": schedule, "route_time": float(route_time)}
 
+    def simulate_ground_plan(
+        self,
+        queue: Sequence[Dict[str, Any]],
+        first_cav_arrival_time: float,
+    ) -> Dict[str, Any]:
+        """Reuse the stage-one recovery model after a proposed ground-route prefix.
+
+        ``first_cav_arrival_time`` is the physical arrival at the first queued
+        recovery node after executing the candidate CAV route.  No simulator
+        state is read or written except for immutable travel-time lookups.
+        """
+        if not queue:
+            return {"feasible": True, "reason": "ok", "schedule": [], "route_time": 0.0}
+        schedule: List[Dict[str, Any]] = []
+        current_time = float(first_cav_arrival_time)
+        current_node = int(queue[0]["recovery_node"])
+        route_time = max(0.0, current_time - float(self.sim.now))
+        use_battery = bool(self.cfg.get("use_battery_feasibility", True))
+        for index, entry in enumerate(queue):
+            node = int(entry["recovery_node"])
+            if index == 0:
+                cav_arrive = current_time
+            else:
+                travel_time = float(self.sim.network.get_vehicle_time(current_node, node))
+                if not math.isfinite(travel_time):
+                    return {
+                        "feasible": False,
+                        "reason": "vehicle_unreachable",
+                        "schedule": schedule,
+                        "route_time": math.inf,
+                    }
+                route_time += travel_time
+                cav_arrive = current_time + travel_time
+            eta = float(entry.get("eta", self.sim.now))
+            start = max(cav_arrive, eta)
+            finish = start + float(entry.get("recovery_duration", 0.0))
+            uav_wait = max(0.0, start - eta)
+            cav_wait = max(0.0, eta - cav_arrive)
+            hover_power = float(entry.get("hover_power", self.agent_cfg.get("drone_hover_power", 0.65)))
+            hover_energy = hover_power * uav_wait
+            battery_after_wait = float(entry.get("battery_at_eta", math.inf)) - hover_energy
+            reserve = float(entry.get("battery_reserve", self.cfg.get("battery_reserve", 0.0)))
+            row = {
+                "queue_index": index,
+                "uav_id": str(entry.get("uav_id", entry.get("drone_id"))),
+                "drone_id": str(entry.get("drone_id", entry.get("uav_id"))),
+                "sortie_id": str(entry.get("sortie_id", entry.get("drone_id"))),
+                "recovery_node": node,
+                "eta": eta,
+                "cav_arrival_time": float(cav_arrive),
+                "scheduled_start_time": float(start),
+                "scheduled_finish_time": float(finish),
+                "predicted_uav_wait": float(uav_wait),
+                "predicted_cav_wait": float(cav_wait),
+                "predicted_hover_energy": float(hover_energy),
+                "hover_power": float(hover_power),
+                "battery_after_wait": float(battery_after_wait),
+                "battery_reserve": float(reserve),
+                "is_new": False,
+            }
+            schedule.append(row)
+            if use_battery and battery_after_wait < reserve - 1e-9:
+                return {
+                    "feasible": False,
+                    "reason": "battery_reserve",
+                    "schedule": schedule,
+                    "route_time": float(route_time),
+                }
+            current_time = finish
+            current_node = node
+        return {
+            "feasible": True,
+            "reason": "ok",
+            "schedule": schedule,
+            "route_time": float(route_time),
+        }
+
     def locked_prefix_length(self, queue: Sequence[Dict[str, Any]]) -> int:
         preserve = bool(self.cfg.get("preserve_locked_prefix", True))
         horizon = float(self.cfg.get("lock_horizon_s", 120.0))

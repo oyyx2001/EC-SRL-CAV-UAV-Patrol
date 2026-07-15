@@ -1,0 +1,3 @@
+base: scenario_60node_stage3_c3_reroute.yaml
+tasks:
+  spatial_concentration: medium

@@ -1,0 +1,4 @@
+base: scenario_60node_stage3_cav_common.yaml
+cav_control:
+  mode: active_rule_based
+  action_set: [keep_route, wait, move_to]

@@ -15,6 +15,7 @@ from .task_pool import TaskPool
 from .vehicle import Vehicle
 from .drone import Drone
 from .recovery_scheduler import RecoveryInsertionScheduler
+from .cav_controller import ActiveCAVController
 from dynamic_patrol_marl.planner.sortie_generator import Sortie, SortieGenerator
 from dynamic_patrol_marl.utils.metrics import EpisodeMetrics, summarize_task_metrics
 
@@ -92,6 +93,9 @@ class Simulator:
         self.completed_since_last = 0
         self.expired_since_last = 0
         self._last_expired_ids = set()
+        self.uav_return_time_s = 0.0
+        self.uav_return_distance_m = 0.0
+        self.ground_controller = ActiveCAVController(self)
 
     def reset(self) -> None:
         self.__init__(self.cfg, self.seed, self.scenario)
@@ -253,7 +257,8 @@ class Simulator:
                 }
             )
             launched += 1
-        self._set_vehicle_next_recovery_target()
+        if not self.ground_controller.active:
+            self._set_vehicle_next_recovery_target()
         return launched
 
     def _append_fifo_entry(self, sortie: Sortie, evaluation: Dict[str, Any]) -> None:
@@ -284,13 +289,29 @@ class Simulator:
             if self.now + 1e-9 >= next_decision:
                 candidates = self.get_candidates(no_multitask=no_multitask, no_priority=no_priority)
                 selected = policy(self, candidates) if candidates else None
-                self.dispatch_sorties(selected)
+                launched = self.dispatch_sorties(selected)
+                if self.ground_controller.active:
+                    self.ground_controller.decide(
+                        ["FIXED_INTERVAL", "RECOVERY_QUEUE_UPDATED"] if launched else ["FIXED_INTERVAL"],
+                        force=True,
+                    )
                 next_decision += self.decision_interval
             self.step(min(self.dt, self.horizon - self.now))
         return self.metrics(method_name)
 
     def step(self, dt: float) -> None:
-        if dt <= 0:
+        if dt < -1e-9:
+            raise ValueError("Simulation step cannot be negative")
+        if dt <= 1e-9:
+            # Event-driven execution can legitimately expose a zero-duration
+            # segment (for example, when active rendezvous control moves the
+            # final UAV recovery point onto its current node).  Flush those
+            # instantaneous physical transitions at the current timestamp;
+            # otherwise the event queue keeps rescheduling the same event at
+            # ``now`` and the episode never advances.
+            for drone in self.drones:
+                self._advance_drone(drone, 0.0, self.now)
+            self._recover_waiting_drones(self.now)
             return
         start = self.now
         self.last_step_vehicle_arrivals = []
@@ -305,7 +326,13 @@ class Simulator:
         self._last_expired_ids.update(after_expired)
         # Vehicle waiting if it reaches a rendezvous before a drone.
         front = self.recovery_queue[0] if self.recovery_queue else None
-        if self.vehicle.is_idle() and front is not None and int(front["recovery_node"]) == self.vehicle.position and self.get_drone(str(front["drone_id"])).status != "idle":
+        if (
+            self.vehicle.is_idle()
+            and not self.vehicle.is_waiting(self.now)
+            and front is not None
+            and int(front["recovery_node"]) == self.vehicle.position
+            and self.get_drone(str(front["drone_id"])).status != "idle"
+        ):
             self.vehicle.add_wait(dt)
         # Vehicle update.
         route_log_len = len(self.vehicle.route_log)
@@ -324,7 +351,7 @@ class Simulator:
             self._recover_waiting_drones(event_time)
         # Recover if vehicle is already at a waiting drone's recovery point.
         self._recover_waiting_drones(event_time)
-        if self.vehicle.is_idle():
+        if self.vehicle.is_idle() and not self.ground_controller.active:
             self._set_vehicle_next_recovery_target(event_time)
         self.now += dt
         self.task_pool.update_release_and_expiry(self.now)
@@ -338,9 +365,10 @@ class Simulator:
             return
         if drone.status != "flying" or drone.sortie is None:
             return
-        remain = dt
+        remain = max(0.0, float(dt))
         local_time = step_start
-        while remain > 1e-9 and drone.status == "flying":
+        instantaneous_transitions = 0
+        while drone.status == "flying":
             if drone.segment_index >= len(drone.sortie.segments):
                 self._drone_arrived_recovery(drone, local_time)
                 break
@@ -350,8 +378,15 @@ class Simulator:
                 if entry is not None:
                     entry["status"] = "returning"
             if drone.segment_remaining <= 1e-9:
-                drone.segment_remaining = float(seg["duration"])
+                drone.segment_remaining = max(0.0, float(seg["duration"]))
+            if drone.segment_remaining > 1e-9 and remain <= 1e-9:
+                break
             use = min(remain, drone.segment_remaining)
+            if seg.get("type") == "fly" and drone.segment_index >= len(drone.sortie.segments) - 1:
+                self.uav_return_time_s += float(use)
+                self.uav_return_distance_m += float(use) * float(
+                    self.cfg["network"].get("drone_speed_mps", 14.0)
+                )
             self._consume(drone, use, seg["type"])
             drone.segment_remaining -= use
             remain -= use
@@ -378,6 +413,12 @@ class Simulator:
                     break
                 else:
                     drone.segment_remaining = float(drone.sortie.segments[drone.segment_index]["duration"])
+                if use <= 1e-9:
+                    instantaneous_transitions += 1
+                    if instantaneous_transitions > len(drone.sortie.segments) + 1:
+                        raise RuntimeError("UAV instantaneous segment safety limit exceeded")
+                continue
+            break
 
     def _consume(self, drone: Drone, dt: float, mode: str) -> None:
         if mode == "service":
@@ -419,11 +460,18 @@ class Simulator:
 
     def _recover_drone(self, drone: Drone, t: float) -> None:
         rec = drone.position
+        # A wait whose purpose has physically completed must end at the actual
+        # recovery event, even when the UAV arrives before its predicted ETA.
+        if self.vehicle.is_waiting(t) or self.vehicle.wait_until is not None:
+            self.vehicle.end_wait()
         entry = self._queue_entry_for_drone(drone.id)
         if entry is not None:
             arrival_time = entry.get("recovery_arrival_time")
             actual_wait = max(0.0, float(t) - float(arrival_time)) if arrival_time is not None else 0.0
             self.recovery_wait_records.append(actual_wait)
+            self.ground_controller.record_recovery(
+                str(entry.get("sortie_id", entry.get("drone_id", ""))), actual_wait
+            )
             entry["status"] = "completed"
         drone.reset_after_recovery(rec, t)
         if self.recovery_queue and str(self.recovery_queue[0]["drone_id"]) == drone.id:
@@ -444,12 +492,14 @@ class Simulator:
     def _set_vehicle_next_recovery_target(self, event_time: Optional[float] = None) -> None:
         if not self.vehicle.is_idle():
             return
+        timestamp = self.now if event_time is None else float(event_time)
+        if self.vehicle.is_waiting(timestamp):
+            return
         if not self.recovery_queue:
             return
         target = int(self.recovery_queue[0]["recovery_node"])
         if target == self.vehicle.position:
             return
-        timestamp = self.now if event_time is None else float(event_time)
         self.vehicle.set_target(target, self.network, timestamp)
         self.event_log.append({"time": timestamp, "event": "vehicle_depart", "agent": self.vehicle.id, "node": self.vehicle.position, "target": target, "tasks": ""})
 
@@ -565,6 +615,10 @@ class Simulator:
             recovery_attempts=insertion_count,
             infeasible_recoveries=self.infeasible_recoveries,
             minimum_battery_observed=float(self.minimum_battery_observed),
+            cav_waiting_time_s=float(self.vehicle.wait_time),
+            uav_return_distance_m=float(self.uav_return_distance_m),
+            uav_return_time_s=float(self.uav_return_time_s),
+            **self.ground_controller.summary(),
         )
         for k, v in base.items():
             setattr(m, k, v)
@@ -579,3 +633,7 @@ class Simulator:
         pd.DataFrame(self.vehicle.route_log, columns=["time", "node"]).to_csv(out / f"{prefix}_vehicle_route.csv", index=False)
         pd.DataFrame(self.vehicle.route_edge_log, columns=["time", "from_node", "to_node"]).to_csv(out / f"{prefix}_vehicle_edges.csv", index=False)
         pd.DataFrame(self.insertion_log).to_csv(out / f"{prefix}_recovery_insertions.csv", index=False)
+        pd.DataFrame(self.ground_controller.action_log).to_csv(out / f"{prefix}_cav_actions.csv", index=False)
+        pd.DataFrame(self.ground_controller.candidate_log).to_csv(out / f"{prefix}_ground_candidates.csv", index=False)
+        pd.DataFrame(self.ground_controller.route_change_log).to_csv(out / f"{prefix}_route_changes.csv", index=False)
+        pd.DataFrame(self.ground_controller.recovery_schedule_log).to_csv(out / f"{prefix}_recovery_schedule.csv", index=False)
