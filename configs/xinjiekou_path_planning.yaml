@@ -1,0 +1,7 @@
+base: xinjiekou_scenario.yaml
+project:
+  name: dynamic_patrol_default
+  results_dir: results/default_training
+uav_path_planning:
+  enabled: true
+  use_path_cache: true

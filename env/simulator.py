@@ -16,6 +16,11 @@ from .vehicle import Vehicle
 from .drone import Drone
 from .recovery_scheduler import RecoveryInsertionScheduler
 from .cav_controller import ActiveCAVController
+from .xinjiekou_adapter import (
+    build_direct_edge_task_stream,
+    build_periodic_task_stream,
+    load_direct_edge_task_manifest,
+)
 from dynamic_patrol_marl.planner.sortie_generator import Sortie, SortieGenerator
 from dynamic_patrol_marl.planner.joint_plan import JointPlanGenerator
 from dynamic_patrol_marl.utils.metrics import EpisodeMetrics, summarize_task_metrics
@@ -41,9 +46,61 @@ class Simulator:
         self.rng = np.random.default_rng(self.seed)
         self.scenario = scenario
         self.network = RoadNetwork(cfg)
+        simulation_cfg = cfg.get("simulation", {})
+        self.task_release_horizon = float(
+            simulation_cfg.get("task_release_horizon_s", simulation_cfg.get("horizon_s", 3600))
+        )
+        self.drain_phase_enabled = bool(simulation_cfg.get("drain_phase_enabled", False))
+        self.max_drain_time = float(simulation_cfg.get("max_drain_time_s", 0.0)) if self.drain_phase_enabled else 0.0
+        self.hard_horizon = self.task_release_horizon + max(0.0, self.max_drain_time)
+        # ``horizon`` is retained as the physical hard upper bound for legacy
+        # callers.  Task generation/release use ``task_release_horizon``.
+        self.horizon = self.hard_horizon
         self.task_generator = TaskGenerator(cfg, self.network, self.seed)
-        self.tasks = self.task_generator.generate_episode_tasks()
-        self.task_pool = TaskPool(self.tasks)
+        formal_task_cfg = dict(cfg.get("xinjiekou_tasks", {}) or {})
+        task_source_cfg = dict(cfg.get("xinjiekou_task_source", {}) or {})
+        mapping_mode = str(formal_task_cfg.get("mapping_mode", task_source_cfg.get("mapping_source", "generated")))
+        self.task_mapping_source = mapping_mode
+        self.task_mapping_unmapped: List[Dict[str, Any]] = []
+        if mapping_mode == "direct_compressed_edge":
+            manifest_cfg = dict(formal_task_cfg.get("task_manifest", {}) or {})
+            manifest_mode = str(manifest_cfg.get("mode", "generate")).lower()
+            if manifest_mode == "load":
+                manifest_path = str(manifest_cfg.get("path", ""))
+                if not manifest_path:
+                    raise ValueError("xinjiekou_tasks.task_manifest.path is required when mode=load")
+                self.tasks = load_direct_edge_task_manifest(
+                    self.network, str(formal_task_cfg["registry_path"]), self.network._resolve_import_path(manifest_path)
+                )
+                self.task_mapping_source = "direct_compressed_edge_manifest"
+            elif manifest_mode == "generate":
+                self.tasks = build_direct_edge_task_stream(
+                    self.network,
+                    str(formal_task_cfg["registry_path"]),
+                    formal_task_cfg,
+                    release_horizon_s=self.task_release_horizon,
+                    seed=self.seed,
+                )
+            else:
+                raise ValueError(f"Unknown Xinjiekou task manifest mode: {manifest_mode}")
+        elif bool(task_source_cfg.get("enabled", False)):
+            self.tasks, self.task_mapping_unmapped = build_periodic_task_stream(
+                self.network,
+                str(task_source_cfg["task_model_file"]),
+                str(task_source_cfg["edge_file"]),
+                release_horizon_s=self.task_release_horizon,
+                overrides=dict(task_source_cfg.get("edge_overrides", {}) or {}),
+                mapping_source=mapping_mode,
+            )
+            if self.task_mapping_unmapped and bool(task_source_cfg.get("require_complete_mapping", True)):
+                raise ValueError(f"Xinjiekou task mapping incomplete: {self.task_mapping_unmapped}")
+        else:
+            self.tasks = self.task_generator.generate_episode_tasks()
+        self.task_pool = TaskPool(
+            self.tasks,
+            task_release_horizon_s=self.task_release_horizon,
+            expire_executing=bool(simulation_cfg.get("expire_executing_tasks", False)),
+        )
         self.sortie_generator = SortieGenerator(cfg, self.network)
         self.vehicle = Vehicle(id="veh0", position=self.network.patrol_center)
         self.vehicle.route_log.append((0.0, self.vehicle.position))
@@ -59,7 +116,6 @@ class Simulator:
         ]
         self.now = 0.0
         self.task_pool.update_release_and_expiry(self.now)
-        self.horizon = float(cfg["simulation"].get("horizon_s", 3600))
         self.dt = float(cfg["simulation"].get("dt_s", 10))
         self.decision_interval = float(cfg["simulation"].get("decision_interval_s", 60))
         time_cfg = cfg.get("time", {})
@@ -70,6 +126,11 @@ class Simulator:
         self.event_log: List[Dict[str, Any]] = []
         self.sortie_log: List[Dict[str, Any]] = []
         self.recovery_queue: List[Dict[str, Any]] = []
+        # Time integral of the actual recovery-queue occupancy.  It is kept
+        # separately from recovery_queue_travel_time_s(), which is a forward
+        # prediction used for candidate generation rather than a realised
+        # physical quantity suitable for reward accounting.
+        self.recovery_queue_occupancy_integral_s = 0.0
         self.recovery_schedule_version = 0
         recovery_cfg = cfg.get("recovery", {})
         self.recovery_rule = str(recovery_cfg.get("rule", cfg.get("recovery_rule", "fifo"))).lower()
@@ -236,6 +297,16 @@ class Simulator:
         launched = 0
         for s in accepted:
             drone = self.get_drone(s.drone_id)
+            if bool(self.cfg.get("uav_path_planning", {}).get("enabled", False)):
+                realized = self.sortie_generator.materialize_selected_sortie(
+                    s, drone, self.now, self.task_pool.by_id
+                )
+                if realized is None:
+                    # A selected estimate may fail obstacle-aware planning or
+                    # post-plan deadline/battery/recovery validation.
+                    self.illegal_actions += 1
+                    continue
+                s = realized
             evaluation = self.evaluate_insertion(s, commit=False)
             if self.dynamic_insertion_enabled:
                 if not evaluation["feasible"]:
@@ -324,6 +395,10 @@ class Simulator:
         self.completed_since_last = 0
         self.expired_since_last = 0
         self._integrate_aoi(dt)
+        # Queue membership is constant over this physical segment.  All
+        # insertions and removals occur at its event boundary, so this is the
+        # exact piecewise-constant integral, not an endpoint approximation.
+        self.recovery_queue_occupancy_integral_s += float(len(self.recovery_queue)) * float(dt)
         # Expiry before movement.
         before_expired = {t.id for t in self.tasks if t.status == "expired"}
         self.task_pool.update_release_and_expiry(self.now)
@@ -379,7 +454,7 @@ class Simulator:
                 self._drone_arrived_recovery(drone, local_time)
                 break
             seg = drone.sortie.segments[drone.segment_index]
-            if drone.segment_index >= len(drone.sortie.segments) - 1 and seg.get("type") == "fly":
+            if drone.segment_index >= len(drone.sortie.segments) - 2 and seg.get("type") in {"fly", "horizontal_flight"}:
                 entry = self._queue_entry_for_drone(drone.id)
                 if entry is not None:
                     entry["status"] = "returning"
@@ -388,7 +463,7 @@ class Simulator:
             if drone.segment_remaining > 1e-9 and remain <= 1e-9:
                 break
             use = min(remain, drone.segment_remaining)
-            if seg.get("type") == "fly" and drone.segment_index >= len(drone.sortie.segments) - 1:
+            if seg.get("type") in {"fly", "horizontal_flight"} and drone.segment_index >= len(drone.sortie.segments) - 2:
                 self.uav_return_time_s += float(use)
                 self.uav_return_distance_m += float(use) * float(
                     self.cfg["network"].get("drone_speed_mps", 14.0)
@@ -399,19 +474,50 @@ class Simulator:
             local_time += use
             if drone.segment_remaining <= 1e-9:
                 # Finish segment.
-                if seg["type"] == "fly":
+                if seg["type"] in {"fly", "horizontal_flight"}:
                     drone.position = int(seg["to"])
+                elif seg["type"] == "edge_coverage":
+                    tid = int(seg["task_id"])
+                    task = self.task_pool.by_id[tid]
+                    if task.status in {"assigned", "unassigned"}:
+                        self.task_pool.mark_executing(
+                            tid, drone.id, max(step_start, local_time - float(seg["duration"]))
+                        )
+                    task.metadata["edge_coverage_completed_at"] = float(local_time)
+                    task.metadata["selected_orientation"] = str(seg.get("selected_orientation", ""))
+                    task.metadata["edge_coverage_distance_m"] = float(seg.get("distance_m", 0.0))
+                    drone.position = int(seg["to"])
+                    self.event_log.append(
+                        {
+                            "time": local_time,
+                            "event": "edge_coverage_done",
+                            "agent": drone.id,
+                            "node": int(seg["to"]),
+                            "tasks": str(tid),
+                            "edge_id": str(seg.get("edge_id", "")),
+                        }
+                    )
                 elif seg["type"] == "service":
                     tid = int(seg["task_id"])
                     if self.task_pool.by_id[tid].status in {"assigned", "unassigned"}:
                         self.task_pool.mark_executing(tid, drone.id, max(step_start, local_time - float(seg["duration"])))
-                    if bool(seg.get("service_final", True)):
+                    coverage_ok = (
+                        not bool(seg.get("requires_edge_coverage", False))
+                        or self.task_pool.by_id[tid].metadata.get("edge_coverage_completed_at") is not None
+                    )
+                    if bool(seg.get("service_final", True)) and coverage_ok:
+                        was_done = self.task_pool.by_id[tid].status == "done"
                         self.task_pool.mark_done(tid, local_time, drone.id)
-                        drone.completed_task_ids.append(tid)
-                        self.completed_since_last += 1
-                        for arc in self.task_pool.by_id[tid].target_arcs:
-                            self.cover_last_time[arc] = local_time
-                        self.event_log.append({"time": local_time, "event": "task_done", "agent": drone.id, "node": int(seg["to"]), "tasks": str(tid)})
+                        # ``mark_done`` deliberately ignores expired/censored
+                        # tasks.  Count a completion only when the state really
+                        # changed; this prevents a stale service event from
+                        # double-counting an edge task during drain.
+                        if self.task_pool.by_id[tid].status == "done" and not was_done:
+                            drone.completed_task_ids.append(tid)
+                            self.completed_since_last += 1
+                            for arc in self.task_pool.by_id[tid].target_arcs:
+                                self.cover_last_time[arc] = local_time
+                            self.event_log.append({"time": local_time, "event": "task_done", "agent": drone.id, "node": int(seg["to"]), "tasks": str(tid)})
                     drone.position = int(seg["to"])
                 drone.segment_index += 1
                 if drone.segment_index >= len(drone.sortie.segments):
@@ -427,13 +533,20 @@ class Simulator:
             break
 
     def _consume(self, drone: Drone, dt: float, mode: str) -> None:
+        flight = self.cfg.get("uav_flight", {})
         if mode == "service":
-            rate = float(self.cfg["agents"].get("drone_service_power", 0.85))
+            rate = float(flight.get("service_power", self.cfg["agents"].get("drone_service_power", 0.85)))
             drone.service_time += dt
         elif mode == "hover":
-            rate = float(self.cfg["agents"].get("drone_hover_power", 0.65))
+            rate = float(flight.get("hover_power", self.cfg["agents"].get("drone_hover_power", 0.65)))
+        elif mode == "vertical_climb":
+            rate = float(flight.get("climb_power", self.cfg["agents"].get("drone_fly_power", 1.0)))
+            drone.fly_time += dt
+        elif mode == "vertical_descent":
+            rate = float(flight.get("descent_power", self.cfg["agents"].get("drone_fly_power", 1.0)))
+            drone.fly_time += dt
         else:
-            rate = float(self.cfg["agents"].get("drone_fly_power", 1.0))
+            rate = float(flight.get("cruise_power", self.cfg["agents"].get("drone_fly_power", 1.0)))
             drone.fly_time += dt
         energy = rate * dt
         drone.energy_used += energy
@@ -573,7 +686,14 @@ class Simulator:
     def _all_terminal(self) -> bool:
         if any(d.status != "idle" for d in self.drones):
             return False
-        return all(t.status in {"done", "expired"} for t in self.tasks)
+        if self.recovery_queue:
+            return False
+        cohort = [
+            task
+            for task in self.tasks
+            if float(task.release_time) < float(self.task_release_horizon)
+        ]
+        return all(t.status in {"done", "expired", "censored"} for t in cohort)
 
     def metrics(self, method_name: str) -> EpisodeMetrics:
         base = summarize_task_metrics(self.tasks, int(self.cfg["simulation"].get("high_priority_threshold", 8)))
@@ -642,6 +762,12 @@ class Simulator:
         pd.DataFrame(self.vehicle.route_edge_log, columns=["time", "from_node", "to_node"]).to_csv(out / f"{prefix}_vehicle_edges.csv", index=False)
         pd.DataFrame(self.insertion_log).to_csv(out / f"{prefix}_recovery_insertions.csv", index=False)
         pd.DataFrame(self.ground_controller.action_log).to_csv(out / f"{prefix}_cav_actions.csv", index=False)
+        pd.DataFrame(self.sortie_generator.candidate_generation_log).to_csv(
+            out / f"{prefix}_candidate_generation_calls.csv", index=False
+        )
+        pd.DataFrame([dict(getattr(self.sortie_generator, "_cache_counts", {}))]).to_csv(
+            out / f"{prefix}_candidate_cache_statistics.csv", index=False
+        )
         if self.joint_plan_generator is not None:
             pd.DataFrame(self.joint_plan_generator.generation_log).to_csv(out / f"{prefix}_joint_plan_generation.csv", index=False)
             pd.DataFrame(self.joint_plan_generator.rejection_log).to_csv(out / f"{prefix}_joint_plan_rejections.csv", index=False)

@@ -31,7 +31,9 @@ def load_config(path: str | Path) -> Dict[str, Any]:
         base_path = path.parent / base_name
         base_cfg = load_config(base_path)
         cfg = deep_update(base_cfg, cfg)
-    cfg.setdefault("_config_path", str(path))
+    # Record the file requested at this level, not the deepest inherited base.
+    # This keeps run metadata and checkpoints tied to the effective entry config.
+    cfg["_config_path"] = str(path)
     return cfg
 
 

@@ -16,6 +16,7 @@ from dynamic_patrol_marl.env.simulator import Simulator
 from dynamic_patrol_marl.env.events import Event, EventQueue
 from dynamic_patrol_marl.planner.sortie_generator import Sortie
 from dynamic_patrol_marl.planner.joint_plan import JointPlan, JointPlanCache
+from dynamic_patrol_marl.rl.reward_ledger import RewardComponents, RewardLedger
 from dynamic_patrol_marl.rl.smdp import transition_discount
 
 
@@ -97,6 +98,8 @@ class DynamicPatrolEnv(BaseEnv):
         self.event_queue: Optional[EventQueue] = None
         self.transition_log: List[Dict[str, Any]] = []
         self.event_timeline: List[Dict[str, Any]] = []
+        self.reward_ledger = RewardLedger()
+        self._last_reward_ledger_components: Dict[str, float] = {}
         self.decision_index = 0
         self._decision_epoch_serial = 0
         self.meaningful_decisions = 0
@@ -110,6 +113,10 @@ class DynamicPatrolEnv(BaseEnv):
         self._delta_t_history: List[float] = []
         self._discount_history: List[float] = []
         self._pending_ground_trigger_events: List[str] = ["INITIAL_DECISION"]
+        self._cutoff_snapshot: Optional[Dict[str, Any]] = None
+        self._operation_reward = 0.0
+        self._drain_reward = 0.0
+        self._censored_task_ids: set[int] = set()
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict] = None):
         if self.seed_scheduler is not None:
@@ -125,6 +132,7 @@ class DynamicPatrolEnv(BaseEnv):
         self.time_mode = self.sim.time_mode
         self.transition_log = []
         self.event_timeline = []
+        self._last_reward_ledger_components = {}
         self.decision_index = 0
         self._decision_epoch_serial = 0
         self.meaningful_decisions = 0
@@ -138,6 +146,10 @@ class DynamicPatrolEnv(BaseEnv):
         self._delta_t_history = []
         self._discount_history = []
         self._pending_ground_trigger_events = ["INITIAL_DECISION"]
+        self._cutoff_snapshot = None
+        self._operation_reward = 0.0
+        self._drain_reward = 0.0
+        self._censored_task_ids = set()
         if self.time_mode == "event_driven":
             self._initialize_event_queue()
         self.joint_plan_cache = None
@@ -251,7 +263,7 @@ class DynamicPatrolEnv(BaseEnv):
         after_done_ids = {t.id for t in self.sim.tasks if t.status == "done"}
         after_done = len(after_done_ids)
         after_expired = sum(t.status == "expired" for t in self.sim.tasks)
-        terminated = self.sim.now >= self.sim.horizon or self.sim._all_terminal()
+        terminated, truncated = self._episode_status()
         new_done_tasks = [t for t in self.sim.tasks if t.id in after_done_ids - before_done_ids]
         terminal_penalty = self._terminal_undone_penalty() if terminated else 0.0
         if use_interval_reward:
@@ -275,7 +287,7 @@ class DynamicPatrolEnv(BaseEnv):
                 terminal_penalty,
             )
             reward_components = {"other": float(reward)}
-        truncated = False
+        self._accumulate_phase_reward(decision_time, reward)
         self._prepare_decision_epoch(["FIXED_INTERVAL"])
         obs = self._observation()
         info = {
@@ -284,6 +296,8 @@ class DynamicPatrolEnv(BaseEnv):
             "illegal": illegal,
             "recovery_queue_len": len(self.sim.recovery_queue),
             "time_mode": "fixed_interval",
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
             "decision_time": decision_time,
             "next_decision_time": float(self.sim.now),
             "delta_t": float(self.sim.now - decision_time),
@@ -294,6 +308,7 @@ class DynamicPatrolEnv(BaseEnv):
             "duplicate_event_count": 0,
             "invalid_time_event_count": 0,
             "reward_components": reward_components,
+            "reward_ledger_components": dict(self._last_reward_ledger_components),
             "valid_action_count": int(self.action_masks().sum()),
             "valid_non_wait_action_count": int(self.action_masks()[1:].sum()),
             "forced_wait": bool(action == 0 and int(mask[1:].sum()) == 0),
@@ -310,8 +325,10 @@ class DynamicPatrolEnv(BaseEnv):
         tolerance = float(self.event_cfg.get("event_time_tolerance", 1e-9))
         self.event_queue = EventQueue(time_tolerance=tolerance)
         now = float(self.sim.now)
+        release_horizon = float(self.sim.task_release_horizon)
+        hard_horizon = float(self.sim.hard_horizon)
         for task in sorted(self.sim.tasks, key=lambda item: (float(item.release_time), int(item.id))):
-            if now + tolerance < float(task.release_time) < self.sim.horizon - tolerance:
+            if now + tolerance < float(task.release_time) < release_horizon - tolerance:
                 self.event_queue.schedule(
                     time=float(task.release_time),
                     event_type="TASK_RELEASE",
@@ -320,7 +337,7 @@ class DynamicPatrolEnv(BaseEnv):
                     current_time=now,
                 )
             timeout_time = float(np.nextafter(float(task.deadline), math.inf))
-            if timeout_time < self.sim.horizon - tolerance and timeout_time > now + tolerance:
+            if timeout_time < hard_horizon - tolerance and timeout_time > now + tolerance:
                 self.event_queue.schedule(
                     time=timeout_time,
                     event_type="TASK_TIMEOUT",
@@ -328,9 +345,16 @@ class DynamicPatrolEnv(BaseEnv):
                     payload={"task_id": int(task.id)},
                     current_time=now,
                 )
+        if self.sim.drain_phase_enabled and release_horizon > now + tolerance:
+            self.event_queue.schedule(
+                time=release_horizon,
+                event_type="TASK_RELEASE_CUTOFF",
+                entity_id="episode:release_cutoff",
+                current_time=now,
+            )
         self.event_queue.schedule(
-            time=float(self.sim.horizon),
-            event_type="EPISODE_END",
+            time=hard_horizon,
+            event_type="EPISODE_HARD_LIMIT",
             entity_id="episode",
             current_time=now,
         )
@@ -404,9 +428,15 @@ class DynamicPatrolEnv(BaseEnv):
             remaining = float(drone.segment_remaining or segment.get("duration", 0.0))
             if remaining < -tolerance:
                 continue
-            if segment.get("type") == "service":
+            if segment.get("type") == "vertical_climb":
+                event_type = "UAV_CLIMB_COMPLETE"
+            elif segment.get("type") == "vertical_descent":
+                event_type = "UAV_DESCENT_COMPLETE"
+            elif segment.get("type") == "service":
                 event_type = "UAV_SERVICE_COMPLETE"
-            elif drone.segment_index >= len(drone.sortie.segments) - 1:
+            elif segment.get("type") == "edge_coverage":
+                event_type = "UAV_EDGE_COVERAGE_COMPLETE"
+            elif drone.segment_index >= len(drone.sortie.segments) - 2 and segment.get("type") in {"fly", "horizontal_flight"}:
                 event_type = "UAV_RECOVERY_ARRIVAL"
             else:
                 event_type = "UAV_TASK_ARRIVAL"
@@ -441,16 +471,106 @@ class DynamicPatrolEnv(BaseEnv):
             "aoi_integral": float(self.sim.aoi_integral),
             "uav_wait": float(sum(drone.wait_time for drone in self.sim.drones)),
             "cav_wait": float(self.sim.vehicle.wait_time),
+            "hover_time": float(sum(drone.wait_time for drone in self.sim.drones)),
+            "return_distance": float(getattr(self.sim, "uav_return_distance_m", 0.0)),
+            "cav_distance": float(getattr(self.sim.vehicle, "distance_traveled_m", 0.0)),
             "queue_length": float(len(self.sim.recovery_queue)),
+            "queue_occupancy_integral": float(
+                getattr(self.sim, "recovery_queue_occupancy_integral_s", 0.0)
+            ),
             "queue_travel_time": float(self.sim.recovery_queue_travel_time_s()),
+            # Emergency overrides resolve a hard feasibility conflict and are
+            # intentionally excluded from the soft route-stability penalty.
+            "route_change_count": float(
+                sum(
+                    bool(row.get("route_changed", row.get("action_type") in {"move_to", "reroute"}))
+                    and not bool(row.get("emergency_override"))
+                    for row in getattr(self.sim.ground_controller, "route_change_log", [])
+                )
+            ),
+            "route_reverse_count": float(
+                sum(
+                    bool(row.get("reverse_route_flag")) and not bool(row.get("emergency_override"))
+                    for row in getattr(self.sim.ground_controller, "route_change_log", [])
+                )
+            ),
+            "coordination_failure_count": float(
+                getattr(getattr(self.sim, "joint_plan_generator", None), "commit_failures", 0)
+                + getattr(self.sim, "infeasible_recoveries", 0)
+            ),
         }
 
-    def _episode_terminated(self) -> bool:
+    def _capture_cutoff_state(self) -> None:
+        """Freeze the operational backlog exactly once at release cutoff."""
+
         assert self.sim is not None
-        if self.sim.now >= self.sim.horizon - 1e-9:
-            return True
-        terminate_on_all = bool(self.cfg.get("simulation", {}).get("terminate_on_all_terminal", True))
-        return bool(terminate_on_all and self.sim._all_terminal())
+        if self._cutoff_snapshot is not None:
+            return
+        if self.sim.now + 1e-9 < float(self.sim.task_release_horizon):
+            return
+        cohort = self._release_cohort_tasks()
+        pending = sum(task.status in {"unassigned", "assigned", "executing"} for task in cohort)
+        self._cutoff_snapshot = {
+            "released_task_count": int(len(cohort)),
+            "pending_tasks_at_cutoff": int(pending),
+            "backlog_rate_at_cutoff": float(pending / len(cohort)) if cohort else 0.0,
+        }
+
+    def _release_cohort_tasks(self) -> List[Any]:
+        assert self.sim is not None
+        return [
+            task
+            for task in self.sim.tasks
+            if float(task.release_time) < float(self.sim.task_release_horizon)
+        ]
+
+    def _mark_censored_at_hard_limit(self) -> None:
+        """Mark unresolved released work without converting it to timeout."""
+
+        assert self.sim is not None
+        for task in self._release_cohort_tasks():
+            if task.status in {"done", "expired", "censored"}:
+                continue
+            task.status = "censored"
+            task.metadata["censored_at_s"] = float(self.sim.now)
+            task.metadata["censor_reason"] = "episode_hard_limit"
+            self._censored_task_ids.add(int(task.id))
+
+    def _episode_status(self) -> Tuple[bool, bool]:
+        assert self.sim is not None
+        self._capture_cutoff_state()
+        # During the normal operating window the future task stream must keep
+        # the episode alive even if the currently released backlog is empty.
+        if self.sim.now + 1e-9 < float(self.sim.task_release_horizon):
+            return False, False
+        # Drain-aware Stage 5 episodes always use the explicit quiescence
+        # rule.  Historical configs may set ``terminate_on_all_terminal`` to
+        # false, but that must not suppress the required natural termination
+        # once the released cohort and recovery workflow are empty.
+        terminate_on_all = bool(
+            self.sim.drain_phase_enabled
+            or self.cfg.get("simulation", {}).get("terminate_on_all_terminal", True)
+        )
+        if terminate_on_all and self.sim._all_terminal():
+            return True, False
+        if self.sim.now >= float(self.sim.hard_horizon) - 1e-9:
+            self._mark_censored_at_hard_limit()
+            return False, True
+        return False, False
+
+    def _episode_terminated(self) -> bool:
+        return self._episode_status()[0]
+
+    def _episode_done(self) -> bool:
+        terminated, truncated = self._episode_status()
+        return bool(terminated or truncated)
+
+    def _accumulate_phase_reward(self, decision_time: float, reward: float) -> None:
+        assert self.sim is not None
+        if float(decision_time) < float(self.sim.task_release_horizon) - 1e-9:
+            self._operation_reward += float(reward)
+        else:
+            self._drain_reward += float(reward)
 
     def _event_reward_components(
         self,
@@ -467,8 +587,21 @@ class DynamicPatrolEnv(BaseEnv):
         new_done_ids = set(after["done_ids"]) - set(before["done_ids"])
         new_expired_ids = set(after["expired_ids"]) - set(before["expired_ids"])
         done_tasks = [self.sim.task_pool.by_id[task_id] for task_id in sorted(new_done_ids)]
-        completion = len(new_done_ids) * float(r_cfg.get("done_task", 10.0))
-        completion += float(r_cfg.get("priority_bonus", 0.0)) * sum(float(task.priority) for task in done_tasks)
+        if str(r_cfg.get("mode", "legacy_interval")).lower() == "stage5_coordinated":
+            return self._stage5_coordinated_reward_components(
+                before,
+                after,
+                new_done_ids=new_done_ids,
+                new_expired_ids=new_expired_ids,
+                done_tasks=done_tasks,
+                illegal=illegal,
+                wait_penalty=wait_penalty,
+                delta_t=delta_t,
+                terminated=terminated,
+            )
+        completion_base = len(new_done_ids) * float(r_cfg.get("done_task", 10.0))
+        priority_reward = float(r_cfg.get("priority_bonus", 0.0)) * sum(float(task.priority) for task in done_tasks)
+        completion = completion_base + priority_reward
         timeout = len(new_expired_ids) * float(r_cfg.get("timeout_penalty", -8.0))
         normalize = bool(self.smdp_cfg.get("interval_normalize_reward", True))
         interval_divisor = self.reference_interval_s if normalize else 1.0
@@ -481,9 +614,25 @@ class DynamicPatrolEnv(BaseEnv):
         mean_queue_travel = 0.5 * (float(before["queue_travel_time"]) + float(after["queue_travel_time"]))
         reward_uav_wait = float(r_cfg.get("recovery_queue_penalty", -0.05)) * mean_queue * interval_scale
         reward_cav_wait = float(r_cfg.get("vehicle_recovery_time_penalty", -0.0005)) * mean_queue_travel * interval_scale
-        other = (-15.0 if illegal else 0.0) + float(wait_penalty) * interval_scale
+        illegal_reward = -15.0 if illegal else 0.0
+        wait_action_reward = float(wait_penalty) * interval_scale
+        terminal_undone_reward = 0.0
+        other = illegal_reward + wait_action_reward
         if terminated:
-            other += self._terminal_undone_penalty()
+            terminal_undone_reward = self._terminal_undone_penalty()
+            other += terminal_undone_reward
+        ledger_components = self.reward_ledger.from_legacy_interval(
+            completion_reward=completion_base,
+            priority_reward=priority_reward,
+            timeout_reward=timeout,
+            aoi_reward=reward_aoi,
+            energy_reward=reward_energy,
+            legacy_queue_reward=reward_uav_wait,
+            legacy_cav_queue_reward=reward_cav_wait,
+            wait_action_reward=wait_action_reward,
+            illegal_action_reward=illegal_reward,
+            terminal_undone_reward=terminal_undone_reward,
+        )
         components = {
             "completion": float(completion),
             "timeout": float(timeout),
@@ -493,6 +642,182 @@ class DynamicPatrolEnv(BaseEnv):
             "cav_wait": float(reward_cav_wait),
             "other": float(other),
         }
+        self.reward_ledger.assert_conserved(ledger_components, sum(components.values()))
+        self._last_reward_ledger_components = ledger_components.to_dict()
+        return components
+
+    def _stage5_coordinated_reward_components(
+        self,
+        before: Dict[str, Any],
+        after: Dict[str, Any],
+        *,
+        new_done_ids: set,
+        new_expired_ids: set,
+        done_tasks: List[Any],
+        illegal: bool,
+        wait_penalty: float,
+        delta_t: float,
+        terminated: bool,
+    ) -> Dict[str, float]:
+        assert self.sim is not None
+        r_cfg = self.cfg.get("reward", {})
+        weights = dict(r_cfg.get("stage5_weights", {}))
+        references = dict(r_cfg.get("stage5_references", {}))
+        reference_time = float(references.get("time_s", self.reference_interval_s))
+        return_reference = max(float(references.get("return_distance_m", 1000.0)), 1e-9)
+        cav_reference = max(float(references.get("cav_distance_m", 1000.0)), 1e-9)
+        normalize_interval = bool(self.smdp_cfg.get("interval_normalize_reward", True))
+        interval_divisor = self.reference_interval_s if normalize_interval else 1.0
+
+        completion_reward = float(weights.get("complete", r_cfg.get("done_task", 30.0))) * len(new_done_ids)
+        priority_reward = float(weights.get("priority", r_cfg.get("priority_bonus", 2.0))) * sum(
+            float(task.priority) for task in done_tasks
+        )
+        timeout_base = float(weights.get("timeout", abs(float(r_cfg.get("timeout_penalty", -30.0)))))
+        timeout_priority = float(weights.get("timeout_priority", 0.0))
+        timeout_cost = sum(
+            timeout_base + timeout_priority * float(self.sim.task_pool.by_id[task_id].priority)
+            for task_id in new_expired_ids
+        )
+
+        aoi_increment = max(0.0, float(after["aoi_integral"]) - float(before["aoi_integral"]))
+        aoi_cost = float(weights.get("aoi", abs(float(r_cfg.get("aoi_penalty", -0.00001))))) * aoi_increment / interval_divisor
+
+        energy_increment = max(0.0, float(after["energy"]) - float(before["energy"]))
+        hover_time_increment = max(0.0, float(after.get("hover_time", 0.0)) - float(before.get("hover_time", 0.0)))
+        hover_energy_increment = hover_time_increment * float(self.cfg.get("agents", {}).get("drone_hover_power", 0.65))
+        flight_energy_increment = max(0.0, energy_increment - hover_energy_increment)
+        flight_energy_cost = float(weights.get("flight_energy", 1.0e-6)) * flight_energy_increment
+        hover_energy_cost = float(weights.get("hover_energy", 1.0e-6)) * hover_energy_increment
+
+        return_distance_increment = max(0.0, float(after.get("return_distance", 0.0)) - float(before.get("return_distance", 0.0)))
+        cav_distance_increment = max(0.0, float(after.get("cav_distance", 0.0)) - float(before.get("cav_distance", 0.0)))
+        return_distance_cost = float(weights.get("return_distance", 0.0)) * return_distance_increment / return_reference
+        cav_distance_cost = float(weights.get("cav_distance", 0.0)) * cav_distance_increment / cav_reference
+
+        recovery_wait_increment = max(0.0, float(after.get("uav_wait", 0.0)) - float(before.get("uav_wait", 0.0)))
+        recovery_wait_cost = float(weights.get("recovery_wait", 0.0)) * recovery_wait_increment / max(reference_time, 1e-9)
+        queue_occupancy_increment = max(
+            0.0,
+            float(after.get("queue_occupancy_integral", 0.0))
+            - float(before.get("queue_occupancy_integral", 0.0)),
+        )
+        recovery_queue_cost = (
+            float(weights.get("recovery_queue", 0.0))
+            * queue_occupancy_increment
+            / max(reference_time, 1e-9)
+        )
+
+        route_change_delta = max(0.0, float(after.get("route_change_count", 0.0)) - float(before.get("route_change_count", 0.0)))
+        route_reverse_delta = max(0.0, float(after.get("route_reverse_count", 0.0)) - float(before.get("route_reverse_count", 0.0)))
+        failure_delta = max(
+            0.0,
+            float(after.get("coordination_failure_count", 0.0)) - float(before.get("coordination_failure_count", 0.0)),
+        )
+
+        illegal_reward = -float(weights.get("coordination_failure", 15.0)) if illegal else 0.0
+        terminal_undone_reward = self._terminal_undone_penalty() if terminated else 0.0
+
+        ledger_components = RewardComponents(
+            completion_reward=completion_reward,
+            priority_reward=priority_reward,
+            timeout_cost=timeout_cost,
+            aoi_cost=aoi_cost,
+            flight_energy_cost=flight_energy_cost,
+            hover_energy_cost=hover_energy_cost,
+            return_distance_cost=return_distance_cost,
+            cav_distance_cost=cav_distance_cost,
+            recovery_wait_cost=recovery_wait_cost,
+            recovery_queue_cost=recovery_queue_cost,
+            route_change_cost=float(weights.get("route_change", 0.0)) * route_change_delta,
+            route_reverse_cost=float(weights.get("route_reverse", 0.0)) * route_reverse_delta,
+            coordination_failure_cost=float(weights.get("coordination_failure", 15.0)) * failure_delta,
+            terminal_undone_cost=max(0.0, -terminal_undone_reward),
+            wait_action_cost=0.0,
+            illegal_action_cost=max(0.0, -illegal_reward),
+        ).finalize()
+        components = {
+            "completion_reward": float(ledger_components.completion_reward),
+            "priority_reward": float(ledger_components.priority_reward),
+            "timeout_cost": float(-ledger_components.timeout_cost),
+            "aoi_cost": float(-ledger_components.aoi_cost),
+            "flight_energy_cost": float(-ledger_components.flight_energy_cost),
+            "hover_energy_cost": float(-ledger_components.hover_energy_cost),
+            "return_distance_cost": float(-ledger_components.return_distance_cost),
+            "cav_distance_cost": float(-ledger_components.cav_distance_cost),
+            "recovery_wait_cost": float(-ledger_components.recovery_wait_cost),
+            "recovery_queue_cost": float(-ledger_components.recovery_queue_cost),
+            "route_change_cost": float(-ledger_components.route_change_cost),
+            "route_reverse_cost": float(-ledger_components.route_reverse_cost),
+            "coordination_failure_cost": float(-ledger_components.coordination_failure_cost),
+            "terminal_undone_cost": float(-ledger_components.terminal_undone_cost),
+            "illegal_action_cost": float(-ledger_components.illegal_action_cost),
+        }
+        self.reward_ledger.assert_conserved(ledger_components, sum(components.values()))
+        self._last_reward_ledger_components = ledger_components.to_dict()
+        self._last_reward_ledger_components.update(
+            {
+                "raw_aoi_increment": float(aoi_increment),
+                "raw_energy_increment": float(energy_increment),
+                "raw_hover_energy_increment": float(hover_energy_increment),
+                "raw_flight_energy_increment": float(flight_energy_increment),
+                "raw_return_distance_increment": float(return_distance_increment),
+                "raw_cav_distance_increment": float(cav_distance_increment),
+                "raw_recovery_wait_increment": float(recovery_wait_increment),
+                "raw_recovery_queue_occupancy_increment": float(queue_occupancy_increment),
+                "raw_route_change_delta": float(route_change_delta),
+                "raw_route_reverse_delta": float(route_reverse_delta),
+                "raw_coordination_failure_delta": float(failure_delta),
+            }
+        )
+        return components
+
+    def _reward_audit_components(self, reward: float) -> Dict[str, float]:
+        """Return a stable, signed reward decomposition for offline audits.
+
+        This is deliberately a view of the existing ledger rather than a
+        second reward calculation.  Keeping it here makes the conservation
+        check run at the exact transition boundary used by the trainer.
+        """
+        ledger = self._last_reward_ledger_components
+        value = lambda name: float(ledger.get(name, 0.0))
+        components = {
+            "task_completion_reward": value("completion_reward"),
+            "priority_reward": value("priority_reward"),
+            # Stage 5 has no separate deadline or response-time bonus.  They
+            # remain explicit zero columns to prevent silently reclassifying
+            # a component in downstream analyses.
+            "deadline_reward": 0.0,
+            "response_time_reward": 0.0,
+            "weighted_aoi_reward": -value("aoi_cost"),
+            "recovery_reward": 0.0,
+            "energy_penalty": -value("flight_energy_cost") - value("hover_energy_cost"),
+            "uav_distance_penalty": -value("return_distance_cost"),
+            "cav_distance_penalty": -value("cav_distance_cost"),
+            "waiting_penalty": -value("recovery_wait_cost") - value("recovery_queue_cost"),
+            "timeout_penalty": -value("timeout_cost"),
+            "invalid_action_penalty": -value("illegal_action_cost"),
+            "other_reward": -(
+                value("route_change_cost")
+                + value("route_reverse_cost")
+                + value("coordination_failure_cost")
+                + value("terminal_undone_cost")
+                + value("wait_action_cost")
+                + value("legacy_queue_cost")
+                + value("legacy_cav_queue_cost")
+                + value("other_cost")
+            ),
+        }
+        # This stricter assertion is intentionally separate from the
+        # historical 1e-6 ledger tolerance: the audit CSV must be exactly
+        # reconcilable with the scalar reward emitted to Rainbow.
+        conservation_error = float(reward) - float(sum(components.values()))
+        if abs(conservation_error) >= 1e-8:
+            raise AssertionError(
+                "reward audit components do not conserve transition reward: "
+                f"reward={reward} components={sum(components.values())} diff={conservation_error}"
+            )
+        components["reward_conservation_error"] = conservation_error
         return components
 
     def _step_event_driven(self, action: int):
@@ -573,12 +898,12 @@ class DynamicPatrolEnv(BaseEnv):
             self.instantaneous_decisions += 1
             self._schedule_dynamic_events()
         else:
-            while not self._episode_terminated():
+            while not self._episode_done():
                 self._schedule_dynamic_events()
                 next_time = self.event_queue.peek_time(self.sim.now, self._event_version)
                 if next_time is None:
-                    next_time = float(self.sim.horizon)
-                next_time = min(float(next_time), float(self.sim.horizon))
+                    next_time = float(self.sim.hard_horizon)
+                next_time = min(float(next_time), float(self.sim.hard_horizon))
                 if next_time < self.sim.now - self.event_queue.time_tolerance:
                     self.event_queue.invalid_time_event_count += 1
                     continue
@@ -594,8 +919,10 @@ class DynamicPatrolEnv(BaseEnv):
                     # an event at the current timestamp.  Without this flush,
                     # the same dynamic event is immediately scheduled again.
                     self.sim.step(0.0)
+                self._capture_cutoff_state()
                 derived_map = {
                     "task_done": "TASK_SERVICE_COMPLETE",
+                    "edge_coverage_done": "UAV_EDGE_COVERAGE_COMPLETE",
                     "recover": "UAV_RECOVERED",
                     "vehicle_arrive": "CAV_NODE_ARRIVAL",
                     "drone_wait_recovery": "UAV_RECOVERY_ARRIVAL",
@@ -618,8 +945,8 @@ class DynamicPatrolEnv(BaseEnv):
                     self._ground_action_committed_time = None
                 self._prepare_decision_epoch(batch_types)
                 next_mask_for_decision = self.action_masks()
-                decision_triggered = bool(next_mask_for_decision[1:].any()) and not self._episode_terminated()
-                if not decision_triggered and not self._episode_terminated() and self.decision_mode != "joint_plan":
+                decision_triggered = bool(next_mask_for_decision[1:].any()) and not self._episode_done()
+                if not decision_triggered and not self._episode_done() and self.decision_mode != "joint_plan":
                     next_ground_event = self.event_queue.peek_time(self.sim.now, self._event_version)
                     automatic_ground_action = self.sim.ground_controller.decide(
                         list(dict.fromkeys(self._pending_ground_trigger_events)),
@@ -630,7 +957,7 @@ class DynamicPatrolEnv(BaseEnv):
                     self._pending_ground_trigger_events = []
                     self._prepare_decision_epoch(self._pending_ground_trigger_events)
                     next_mask_for_decision = self.action_masks()
-                    decision_triggered = bool(next_mask_for_decision[1:].any()) and not self._episode_terminated()
+                    decision_triggered = bool(next_mask_for_decision[1:].any()) and not self._episode_done()
                 for event_type in batch_types or ["STATE_ADVANCE"]:
                     self.event_timeline.append(
                         {
@@ -647,11 +974,10 @@ class DynamicPatrolEnv(BaseEnv):
                 processed_event_count += max(len(batch), len(batch_types))
                 self.system_events_processed += max(len(batch), len(batch_types))
                 self._schedule_dynamic_events()
-                if self._episode_terminated() or decision_triggered:
+                if self._episode_done() or decision_triggered:
                     break
 
-        terminated = self._episode_terminated()
-        truncated = False
+        terminated, truncated = self._episode_status()
         delta_t = max(0.0, float(self.sim.now) - decision_time)
         discount = transition_discount(
             self.gamma_reference,
@@ -671,7 +997,11 @@ class DynamicPatrolEnv(BaseEnv):
             terminated=terminated,
         )
         reward = float(sum(reward_components.values()))
+        completed_task_ids = sorted(set(after["done_ids"]) - set(before["done_ids"]))
+        timed_out_task_ids = sorted(set(after["expired_ids"]) - set(before["expired_ids"]))
+        reward_audit = self._reward_audit_components(reward)
         self.sim.reward_total += reward
+        self._accumulate_phase_reward(decision_time, reward)
         self._delta_t_history.append(delta_t)
         self._discount_history.append(discount)
         self._prepare_decision_epoch(trigger_events)
@@ -686,6 +1016,8 @@ class DynamicPatrolEnv(BaseEnv):
             "action_mask": next_mask,
             "time": float(self.sim.now),
             "time_mode": "event_driven",
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
             "illegal": illegal,
             "delta_t": delta_t,
             "transition_discount": discount,
@@ -697,6 +1029,7 @@ class DynamicPatrolEnv(BaseEnv):
             "duplicate_event_count": int(self.event_queue.duplicate_event_count),
             "invalid_time_event_count": int(self.event_queue.invalid_time_event_count),
             "reward_components": reward_components,
+            "reward_ledger_components": dict(self._last_reward_ledger_components),
             "valid_action_count": int(next_mask.sum()),
             "valid_non_wait_action_count": int(next_mask[1:].sum()),
             "forced_wait": forced_wait,
@@ -704,6 +1037,9 @@ class DynamicPatrolEnv(BaseEnv):
             "instantaneous_decision_count": int(self._instantaneous_count),
             "selected_sortie_id": selected_sortie_id,
             "action_type": action_type,
+            "completed_task_ids": completed_task_ids,
+            "timed_out_task_ids": timed_out_task_ids,
+            "reward_audit_components": dict(reward_audit),
             "ground_action": None if ground_action is None else ground_action.action_type,
             "recovery_queue_len": len(self.sim.recovery_queue),
             "wall_clock_step_time_ms": wall_ms,
@@ -717,9 +1053,13 @@ class DynamicPatrolEnv(BaseEnv):
             "delta_t": delta_t,
             "transition_discount": discount,
             "action": int(action),
+            "selected_action": int(action),
             "action_type": action_type,
+            "selected_plan_type": action_type,
             "ground_action": None if ground_action is None else ground_action.action_type,
             "selected_sortie_id": selected_sortie_id,
+            "completed_task_ids": "|".join(map(str, completed_task_ids)),
+            "timed_out_task_ids": "|".join(map(str, timed_out_task_ids)),
             "trigger_events": "|".join(trigger_events),
             "processed_event_count": int(processed_event_count),
             "valid_action_count": valid_action_count,
@@ -727,13 +1067,27 @@ class DynamicPatrolEnv(BaseEnv):
             "forced_wait": forced_wait,
             "instantaneous_dispatch": instantaneous_dispatch,
             "reward_total": reward,
-            "reward_completion": reward_components["completion"],
-            "reward_timeout": reward_components["timeout"],
-            "reward_aoi": reward_components["aoi"],
-            "reward_energy": reward_components["energy"],
-            "reward_uav_wait": reward_components["uav_wait"],
-            "reward_cav_wait": reward_components["cav_wait"],
-            "reward_other": reward_components["other"],
+            "reward_completion": reward_components.get("completion", reward_components.get("completion_reward", 0.0)),
+            "reward_timeout": reward_components.get("timeout", reward_components.get("timeout_cost", 0.0)),
+            "reward_aoi": reward_components.get("aoi", reward_components.get("aoi_cost", 0.0)),
+            "reward_energy": reward_components.get("energy", reward_components.get("flight_energy_cost", 0.0)),
+            "reward_uav_wait": reward_components.get("uav_wait", reward_components.get("recovery_wait_cost", 0.0)),
+            "reward_cav_wait": reward_components.get("cav_wait", reward_components.get("cav_distance_cost", 0.0)),
+            "reward_other": reward_components.get("other", 0.0),
+            **reward_audit,
+            "stage5_reward_final": self._last_reward_ledger_components.get("final_reward", reward),
+            "stage5_reward_completion": self._last_reward_ledger_components.get("completion_reward", 0.0),
+            "stage5_reward_priority": self._last_reward_ledger_components.get("priority_reward", 0.0),
+            "stage5_cost_timeout": self._last_reward_ledger_components.get("timeout_cost", 0.0),
+            "stage5_cost_aoi": self._last_reward_ledger_components.get("aoi_cost", 0.0),
+            "stage5_cost_flight_energy": self._last_reward_ledger_components.get("flight_energy_cost", 0.0),
+            "stage5_cost_hover_energy": self._last_reward_ledger_components.get("hover_energy_cost", 0.0),
+            "stage5_cost_return_distance": self._last_reward_ledger_components.get("return_distance_cost", 0.0),
+            "stage5_cost_cav_distance": self._last_reward_ledger_components.get("cav_distance_cost", 0.0),
+            "stage5_cost_recovery_wait": self._last_reward_ledger_components.get("recovery_wait_cost", 0.0),
+            "stage5_cost_recovery_queue": self._last_reward_ledger_components.get("recovery_queue_cost", 0.0),
+            "stage5_cost_route_change": self._last_reward_ledger_components.get("route_change_cost", 0.0),
+            "stage5_cost_route_reverse": self._last_reward_ledger_components.get("route_reverse_cost", 0.0),
             "queue_length": len(self.sim.recovery_queue),
             "recovery_rule": self.sim.recovery_rule,
             "stale_event_count": int(self.event_queue.stale_event_count),
@@ -753,10 +1107,61 @@ class DynamicPatrolEnv(BaseEnv):
         discounts = np.asarray(self._discount_history, dtype=np.float64)
         metrics = self.sim.metrics("rl_env").to_dict()
         decisions = len(self.transition_log)
+        self._capture_cutoff_state()
+        cohort = self._release_cohort_tasks()
+        released = len(cohort)
+        completed = sum(task.status == "done" for task in cohort)
+        timed_out = sum(task.status == "expired" for task in cohort)
+        censored = sum(task.status == "censored" for task in cohort)
+        cutoff = self._cutoff_snapshot or {
+            "released_task_count": released,
+            "pending_tasks_at_cutoff": 0,
+            "backlog_rate_at_cutoff": 0.0,
+        }
+        total_reward = float(sum(row["reward_total"] for row in self.transition_log))
+        terminated, truncated = self._episode_status()
         return {
             **metrics,
-            "episode_return": float(sum(row["reward_total"] for row in self.transition_log)),
+            "episode_return": total_reward,
             "simulated_time": float(self.sim.now),
+            "task_release_horizon_s": float(self.sim.task_release_horizon),
+            "episode_end_time_s": float(self.sim.now),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "released_task_count": int(released),
+            "completed_task_count_final": int(completed),
+            "timed_out_task_count_final": int(timed_out),
+            "pending_tasks_at_cutoff": int(cutoff["pending_tasks_at_cutoff"]),
+            "backlog_rate_at_cutoff": float(cutoff["backlog_rate_at_cutoff"]),
+            "completed_during_drain": int(sum(
+                task.status == "done"
+                and task.completion_time is not None
+                and float(task.completion_time) >= float(self.sim.task_release_horizon)
+                for task in cohort
+            )),
+            "timed_out_during_drain": int(sum(
+                task.status == "expired" and float(task.deadline) >= float(self.sim.task_release_horizon)
+                for task in cohort
+            )),
+            "drain_duration_s": max(0.0, float(self.sim.now) - float(self.sim.task_release_horizon)),
+            "censored_task_count": int(censored),
+            "censoring_rate": float(censored / released) if released else 0.0,
+            "unresolved_task_count": int(sum(
+                task.status not in {"done", "expired"} for task in cohort
+            )),
+            "unfinished_uav_states": {
+                drone.id: drone.status
+                for drone in self.sim.drones
+                if drone.status != "idle"
+            },
+            "recovery_queue_at_end": int(len(self.sim.recovery_queue)),
+            "completion_rate_final": float(completed / released) if released else 0.0,
+            "timeout_rate_final": float(timed_out / released) if released else 0.0,
+            "operation_reward": float(self._operation_reward),
+            "drain_reward": float(self._drain_reward),
+            "episode_reward_total": total_reward,
+            "reward_per_released_task": float(total_reward / released) if released else 0.0,
+            "reward_per_operation_hour": float(total_reward / max(float(self.sim.task_release_horizon) / 3600.0, 1e-12)),
             "decisions_per_episode": int(decisions),
             "system_events_per_episode": int(self.system_events_processed),
             "meaningful_decisions": int(self.meaningful_decisions),
@@ -773,7 +1178,7 @@ class DynamicPatrolEnv(BaseEnv):
             "zero_duration_transition_rate": self.zero_duration_transitions / decisions if decisions else 0.0,
             "simulated_seconds_per_decision": float(self.sim.now) / decisions if decisions else 0.0,
             "replay_transitions_per_simulated_hour": decisions / max(self.sim.now / 3600.0, 1e-12),
-            "wall_clock_time_ms": float(sum(row["wall_clock_step_time_ms"] for row in self.transition_log)),
+            "wall_clock_time_ms": float(sum(row.get("wall_clock_step_time_ms", 0.0) for row in self.transition_log)),
         }
 
     def action_masks(self) -> np.ndarray:
@@ -823,7 +1228,10 @@ class DynamicPatrolEnv(BaseEnv):
         has_high_priority = any(t.priority >= high_priority_threshold for t in available_tasks)
         has_urgent = any(t.deadline - sim.now <= urgent_threshold for t in available_tasks)
         has_incident = any(t.type == "incident" for t in available_tasks)
-        has_dynamic = any(t.type in {"incident", "congestion"} for t in available_tasks)
+        # Direct-edge Xinjiekou experiments may include additional dynamic
+        # inspection categories.  Every non-routine task should receive the
+        # dynamic wait shaping rather than being treated as ordinary patrol.
+        has_dynamic = any(t.type != "routine" for t in available_tasks)
 
         if has_urgent or has_high_priority:
             return float(r_cfg.get("urgent_wait_penalty", -1.0))
@@ -836,6 +1244,11 @@ class DynamicPatrolEnv(BaseEnv):
     def _terminal_undone_penalty(self) -> float:
         sim = self.sim
         assert sim is not None
+        # Drain-aware episodes never transform unresolved work at the hard
+        # limit into an implicit timeout-like terminal cost.  True deadline
+        # expiry has already been charged by the normal timeout path.
+        if sim.drain_phase_enabled:
+            return 0.0
         undone = sum(t.status != "done" for t in sim.tasks)
         return undone * float(self.cfg.get("reward", {}).get("undone_task_penalty", -20.0))
 

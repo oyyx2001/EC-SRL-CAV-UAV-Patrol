@@ -1,0 +1,18 @@
+# Runtime parameters for the local aerial visibility-graph planner.
+# The former file was corrupted to a scalar ("21"), so it could not be read by
+# uav_path_planner.  These conservative metric values are explicit rather
+# than hidden planner defaults and apply to both packaged regions.
+planner:
+  vertical_clearance_m: 5.0
+  horizontal_clearance_m: 3.0
+  waypoint_outset_m: 1.0
+  waypoint_minimum_spacing_m: 2.0
+  waypoint_simplify_tolerance_m: 0.5
+  waypoint_turn_threshold_deg: 15.0
+  planning_timeout_s: 5.0
+
+regions:
+  xinjiekou:
+    building_height_field: height_m
+  baijiahu:
+    building_height_field: height_m

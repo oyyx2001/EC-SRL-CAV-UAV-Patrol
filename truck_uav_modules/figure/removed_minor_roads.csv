@@ -1,0 +1,487 @@
+compressed_edge_id,source,target,length_m,_classes
+compressed_edge_000001,ground_node_000001,ground_node_000040,159.3833034698414,{'living_street'}
+compressed_edge_000003,ground_node_000001,ground_node_000008,202.13892258445253,{'living_street'}
+compressed_edge_000007,ground_node_000008,ground_node_000984,137.7763731572409,{'living_street'}
+compressed_edge_000011,ground_node_000014,ground_node_001028,128.90475058326305,"{'footway', 'secondary'}"
+compressed_edge_000013,ground_node_000016,ground_node_000047,218.96887631795755,{'residential'}
+compressed_edge_000019,ground_node_000019,ground_node_000160,134.30707148818612,{'tertiary'}
+compressed_edge_000020,ground_node_000019,ground_node_000031,105.45475216087593,"{'residential', 'tertiary'}"
+compressed_edge_000021,ground_node_000019,ground_node_000020,155.16597745238477,{'residential'}
+compressed_edge_000024,ground_node_000021,ground_node_000030,102.33093850468117,{'residential'}
+compressed_edge_000026,ground_node_000022,ground_node_000030,77.71624270289949,{'residential'}
+compressed_edge_000027,ground_node_000024,ground_node_000051,64.4941848662413,{'residential'}
+compressed_edge_000028,ground_node_000026,ground_node_000160,49.436441411907836,{'living_street'}
+compressed_edge_000029,ground_node_000026,ground_node_000028,97.62249002584846,{'living_street'}
+compressed_edge_000030,ground_node_000026,ground_node_000031,133.2638760372268,{'residential'}
+compressed_edge_000031,ground_node_000028,ground_node_000130,111.1659148185745,{'living_street'}
+compressed_edge_000032,ground_node_000028,ground_node_000031,183.32836376956502,{'residential'}
+compressed_edge_000033,ground_node_000030,ground_node_000031,130.40628681591843,{'residential'}
+compressed_edge_000034,ground_node_000031,ground_node_000160,183.18257926321337,"{'residential', 'tertiary'}"
+compressed_edge_000035,ground_node_000033,ground_node_000164,41.6476676202133,{'service'}
+compressed_edge_000036,ground_node_000033,ground_node_000985,74.04839132108144,{'service'}
+compressed_edge_000037,ground_node_000034,ground_node_000985,71.12263927223123,{'service'}
+compressed_edge_000038,ground_node_000034,ground_node_000036,85.79134732620636,"{'service', 'living_street'}"
+compressed_edge_000039,ground_node_000034,ground_node_000997,138.52697316387773,"{'service', 'living_street'}"
+compressed_edge_000040,ground_node_000036,ground_node_000092,82.26860879354751,{'living_street'}
+compressed_edge_000041,ground_node_000036,ground_node_000997,120.57669588446089,{'living_street'}
+compressed_edge_000042,ground_node_000036,ground_node_000037,283.1258430665313,{'service'}
+compressed_edge_000043,ground_node_000037,ground_node_000055,54.228060381418075,{'residential'}
+compressed_edge_000044,ground_node_000037,ground_node_000051,64.91261649638945,{'residential'}
+compressed_edge_000045,ground_node_000037,ground_node_000053,72.19536186389993,{'residential'}
+compressed_edge_000047,ground_node_000038,ground_node_000040,195.90086138787308,{'living_street'}
+compressed_edge_000048,ground_node_000040,ground_node_000045,127.32631690354742,{'living_street'}
+compressed_edge_000049,ground_node_000040,ground_node_000362,352.6849998368808,"{'residential', 'living_street'}"
+compressed_edge_000050,ground_node_000041,ground_node_000045,65.85566246436693,{'living_street'}
+compressed_edge_000051,ground_node_000041,ground_node_000104,92.13545332140966,{'living_street'}
+compressed_edge_000052,ground_node_000041,ground_node_000049,216.79686843303477,{'living_street'}
+compressed_edge_000053,ground_node_000041,ground_node_001029,344.3216711727742,{'living_street'}
+compressed_edge_000054,ground_node_000042,ground_node_000047,57.80110100630445,{'living_street'}
+compressed_edge_000055,ground_node_000042,ground_node_000043,217.65768442794993,{'residential'}
+compressed_edge_000056,ground_node_000042,ground_node_000048,208.66652822796704,{'living_street'}
+compressed_edge_000059,ground_node_000044,ground_node_000047,164.16877466355078,{'residential'}
+compressed_edge_000060,ground_node_000045,ground_node_000046,213.75014962147904,{'living_street'}
+compressed_edge_000061,ground_node_000045,ground_node_000364,345.2139435946922,{'living_street'}
+compressed_edge_000064,ground_node_000048,ground_node_000055,59.68410525184392,{'residential'}
+compressed_edge_000067,ground_node_000051,ground_node_000052,87.07687094650689,{'residential'}
+compressed_edge_000069,ground_node_000054,ground_node_000055,78.81714617334548,{'service'}
+compressed_edge_000070,ground_node_000054,ground_node_000128,109.32830814085048,{'service'}
+compressed_edge_000071,ground_node_000054,ground_node_000073,218.63738644371892,"{'footway', 'service'}"
+compressed_edge_000072,ground_node_000054,ground_node_000418,247.23457875245293,"{'footway', 'service'}"
+compressed_edge_000075,ground_node_000056,ground_node_000995,95.36776456719286,"{'living_street', 'secondary'}"
+compressed_edge_000076,ground_node_000056,ground_node_001034,162.26058989310295,"{'footway', 'secondary'}"
+compressed_edge_000077,ground_node_000073,ground_node_000418,122.22506780315017,"{'footway', 'service'}"
+compressed_edge_000078,ground_node_000073,ground_node_000128,167.85853757994443,"{'footway', 'service'}"
+compressed_edge_000079,ground_node_000092,ground_node_000422,198.87783102633102,{'living_street'}
+compressed_edge_000080,ground_node_000092,ground_node_000424,306.12361985507016,{'living_street'}
+compressed_edge_000082,ground_node_000093,ground_node_000990,77.63006595719955,{'living_street'}
+compressed_edge_000083,ground_node_000104,ground_node_000116,171.43184647528645,"{'living_street', 'secondary'}"
+compressed_edge_000084,ground_node_000104,ground_node_000106,214.07578247763232,{'living_street'}
+compressed_edge_000085,ground_node_000104,ground_node_000105,379.80844673496773,"{'living_street', 'secondary'}"
+compressed_edge_000086,ground_node_000104,ground_node_000392,345.7968365911207,{'living_street'}
+compressed_edge_000094,ground_node_000112,ground_node_000116,76.73379957664993,{'living_street'}
+compressed_edge_000095,ground_node_000112,ground_node_000398,94.59273752394756,{'living_street'}
+compressed_edge_000096,ground_node_000112,ground_node_000449,112.4866686060812,{'living_street'}
+compressed_edge_000097,ground_node_000112,ground_node_000400,141.0695249036074,{'living_street'}
+compressed_edge_000099,ground_node_000113,ground_node_000447,121.44711646983905,{'living_street'}
+compressed_edge_000101,ground_node_000117,ground_node_000459,76.77246658941657,{'living_street'}
+compressed_edge_000102,ground_node_000117,ground_node_000399,100.58804151299583,{'living_street'}
+compressed_edge_000103,ground_node_000117,ground_node_000586,132.8021849483576,{'living_street'}
+compressed_edge_000104,ground_node_000118,ground_node_000990,144.27837579278884,"{'footway', 'living_street'}"
+compressed_edge_000105,ground_node_000128,ground_node_000418,196.4557298886785,"{'footway', 'service'}"
+compressed_edge_000106,ground_node_000130,ground_node_000996,146.7060057390383,"{'service', 'living_street'}"
+compressed_edge_000107,ground_node_000130,ground_node_000142,149.94805984624645,{'living_street'}
+compressed_edge_000108,ground_node_000130,ground_node_000131,252.9223788580535,{'living_street'}
+compressed_edge_000110,ground_node_000131,ground_node_000996,160.09005128977867,"{'service', 'living_street'}"
+compressed_edge_000111,ground_node_000139,ground_node_000996,117.34724372005047,{'service'}
+compressed_edge_000112,ground_node_000142,ground_node_000997,164.04984617849664,{'living_street'}
+compressed_edge_000114,ground_node_000146,ground_node_000204,54.92655457971348,{'service'}
+compressed_edge_000116,ground_node_000146,ground_node_000201,146.43987598923133,"{'residential', 'secondary'}"
+compressed_edge_000117,ground_node_000147,ground_node_000149,58.37748796443408,{'tertiary'}
+compressed_edge_000118,ground_node_000147,ground_node_000148,55.51631374741032,{'tertiary_link'}
+compressed_edge_000120,ground_node_000149,ground_node_000422,189.5679949944853,"{'living_street', 'secondary'}"
+compressed_edge_000123,ground_node_000158,ground_node_000999,82.27543302597641,{'secondary'}
+compressed_edge_000128,ground_node_000162,ground_node_000985,66.96215091884969,{'service'}
+compressed_edge_000130,ground_node_000168,ground_node_000213,91.31451381250692,{'service'}
+compressed_edge_000131,ground_node_000171,ground_node_000427,71.30736693395042,{'service'}
+compressed_edge_000132,ground_node_000171,ground_node_000217,141.72544941585238,{'service'}
+compressed_edge_000133,ground_node_000171,ground_node_001046,160.48659666169564,{'service'}
+compressed_edge_000134,ground_node_000171,ground_node_001011,195.60925495619045,"{'footway', 'service'}"
+compressed_edge_000135,ground_node_000194,ground_node_000198,107.70314817630471,{'footway'}
+compressed_edge_000136,ground_node_000194,ground_node_000201,158.0372635981202,{'service'}
+compressed_edge_000137,ground_node_000198,ground_node_000254,57.44535601077301,{'service'}
+compressed_edge_000138,ground_node_000201,ground_node_001005,60.93846553755584,"{'residential', 'secondary'}"
+compressed_edge_000139,ground_node_000201,ground_node_000254,126.07418690291541,{'residential'}
+compressed_edge_000140,ground_node_000211,ground_node_000213,125.93841876327745,{'service'}
+compressed_edge_000141,ground_node_000217,ground_node_000468,66.67831604144905,{'service'}
+compressed_edge_000142,ground_node_000217,ground_node_001011,87.7688773520117,{'service'}
+compressed_edge_000143,ground_node_000217,ground_node_001046,254.85242160448374,"{'footway', 'service'}"
+compressed_edge_000144,ground_node_000218,ground_node_000444,66.5161592670557,{'service'}
+compressed_edge_000145,ground_node_000218,ground_node_001011,69.06213368175875,{'service'}
+compressed_edge_000146,ground_node_000218,ground_node_000463,88.87225174440826,{'service'}
+compressed_edge_000147,ground_node_000218,ground_node_001049,109.8878099091173,{'service'}
+compressed_edge_000148,ground_node_000220,ground_node_000226,36.36249449099496,{'service'}
+compressed_edge_000149,ground_node_000220,ground_node_001049,70.6320794309796,{'service'}
+compressed_edge_000150,ground_node_000220,ground_node_000233,93.44242794957579,"{'footway', 'service'}"
+compressed_edge_000151,ground_node_000220,ground_node_001011,109.9017027092552,{'service'}
+compressed_edge_000152,ground_node_000226,ground_node_000233,72.46348835142192,{'service'}
+compressed_edge_000153,ground_node_000226,ground_node_001015,74.65824061362957,{'service'}
+compressed_edge_000154,ground_node_000226,ground_node_000468,90.74877484514414,{'service'}
+compressed_edge_000155,ground_node_000233,ground_node_001015,113.49665194377214,{'service'}
+compressed_edge_000156,ground_node_000233,ground_node_000466,138.62208288379475,"{'footway', 'service'}"
+compressed_edge_000157,ground_node_000237,ground_node_001017,61.51994942618,{'service'}
+compressed_edge_000158,ground_node_000237,ground_node_000245,93.7408721636184,"{'residential', 'service'}"
+compressed_edge_000159,ground_node_000237,ground_node_000254,246.78272007519547,"{'residential', 'service'}"
+compressed_edge_000160,ground_node_000245,ground_node_001017,152.29937307738612,"{'residential', 'service', 'tertiary'}"
+compressed_edge_000161,ground_node_000245,ground_node_000701,133.75128677830048,{'residential'}
+compressed_edge_000162,ground_node_000245,ground_node_000268,187.76795517561396,"{'footway', 'residential'}"
+compressed_edge_000163,ground_node_000245,ground_node_001018,256.9955441248264,"{'residential', 'tertiary'}"
+compressed_edge_000164,ground_node_000248,ground_node_001018,36.386596618859265,{'service'}
+compressed_edge_000165,ground_node_000248,ground_node_000696,62.98335601698821,{'service'}
+compressed_edge_000166,ground_node_000248,ground_node_000283,73.7703376362252,{'service'}
+compressed_edge_000167,ground_node_000248,ground_node_001019,98.70977161302656,"{'footway', 'service'}"
+compressed_edge_000168,ground_node_000251,ground_node_000697,58.50868629132312,{'footway'}
+compressed_edge_000169,ground_node_000251,ground_node_000695,65.72396569504352,{'footway'}
+compressed_edge_000170,ground_node_000254,ground_node_000245,241.8772592483483,{'residential'}
+compressed_edge_000171,ground_node_000254,ground_node_001017,337.70307791738117,"{'residential', 'service', 'tertiary'}"
+compressed_edge_000172,ground_node_000254,ground_node_001018,442.39924896482137,"{'residential', 'tertiary'}"
+compressed_edge_000173,ground_node_000265,ground_node_000761,215.5418744631554,"{'residential', 'service'}"
+compressed_edge_000174,ground_node_000268,ground_node_000701,112.36831356462905,"{'footway', 'residential'}"
+compressed_edge_000178,ground_node_000272,ground_node_000463,195.60590412890056,{'residential'}
+compressed_edge_000179,ground_node_000283,ground_node_000695,60.81589777330019,{'footway'}
+compressed_edge_000180,ground_node_000283,ground_node_001023,58.148164866044716,{'service'}
+compressed_edge_000181,ground_node_000283,ground_node_000716,73.51920460316873,{'footway'}
+compressed_edge_000182,ground_node_000283,ground_node_001019,80.41716067967835,"{'footway', 'service'}"
+compressed_edge_000183,ground_node_000294,ground_node_001027,192.28801387836347,"{'living_street', 'secondary'}"
+compressed_edge_000184,ground_node_000306,ground_node_000362,194.86343472180644,{'residential'}
+compressed_edge_000185,ground_node_000324,ground_node_001027,128.70961857087556,{'living_street'}
+compressed_edge_000186,ground_node_000324,ground_node_000342,185.40044972600765,{'living_street'}
+compressed_edge_000187,ground_node_000331,ground_node_000333,43.5213135590852,{'footway'}
+compressed_edge_000188,ground_node_000331,ground_node_000336,64.45284200552193,{'footway'}
+compressed_edge_000189,ground_node_000333,ground_node_001027,275.2322111529051,{'footway'}
+compressed_edge_000190,ground_node_000342,ground_node_000372,94.71994203674437,{'residential'}
+compressed_edge_000191,ground_node_000342,ground_node_000349,183.4367780060291,"{'unclassified', 'service'}"
+compressed_edge_000192,ground_node_000347,ground_node_000379,131.30703533331183,{'living_street'}
+compressed_edge_000193,ground_node_000349,ground_node_000379,71.34700684363375,{'living_street'}
+compressed_edge_000194,ground_node_000349,ground_node_000351,127.56087665948857,{'unclassified'}
+compressed_edge_000195,ground_node_000351,ground_node_000374,51.56762004245942,{'living_street'}
+compressed_edge_000196,ground_node_000351,ground_node_000372,65.91204104934974,{'residential'}
+compressed_edge_000197,ground_node_000351,ground_node_000383,122.97448728270011,{'residential'}
+compressed_edge_000198,ground_node_000360,ground_node_001029,65.89349597784785,{'living_street'}
+compressed_edge_000199,ground_node_000360,ground_node_000373,82.93832733692763,{'living_street'}
+compressed_edge_000202,ground_node_000361,ground_node_000362,79.07147571894981,{'living_street'}
+compressed_edge_000203,ground_node_000361,ground_node_001028,281.9493449079776,"{'footway', 'secondary'}"
+compressed_edge_000204,ground_node_000361,ground_node_000373,272.11079117360475,"{'footway', 'living_street', 'secondary'}"
+compressed_edge_000205,ground_node_000362,ground_node_000364,108.69702235557901,{'residential'}
+compressed_edge_000206,ground_node_000364,ground_node_001029,82.13409122516777,{'residential'}
+compressed_edge_000207,ground_node_000368,ground_node_000370,42.07796571358707,{'footway'}
+compressed_edge_000208,ground_node_000368,ground_node_000372,97.29671659028241,{'footway'}
+compressed_edge_000209,ground_node_000370,ground_node_001030,81.96967432033813,{'footway'}
+compressed_edge_000210,ground_node_000373,ground_node_001030,45.193097051826115,{'footway'}
+compressed_edge_000211,ground_node_000373,ground_node_000374,147.58012798431554,{'living_street'}
+compressed_edge_000212,ground_node_000383,ground_node_000389,53.87167545266227,{'residential'}
+compressed_edge_000213,ground_node_000384,ground_node_000403,57.507687400101446,{'secondary'}
+compressed_edge_000216,ground_node_000389,ground_node_000409,257.64195399217476,{'residential'}
+compressed_edge_000217,ground_node_000392,ground_node_001029,91.3730189833908,{'residential'}
+compressed_edge_000218,ground_node_000392,ground_node_000394,123.71179964107822,{'residential'}
+compressed_edge_000220,ground_node_000394,ground_node_000395,58.39284991263721,{'residential'}
+compressed_edge_000221,ground_node_000395,ground_node_000396,117.77871805315945,{'residential'}
+compressed_edge_000222,ground_node_000395,ground_node_000398,165.67438413290157,{'living_street'}
+compressed_edge_000223,ground_node_000396,ground_node_000575,95.4492179127516,{'residential'}
+compressed_edge_000224,ground_node_000396,ground_node_000580,152.48920892814925,{'residential'}
+compressed_edge_000225,ground_node_000396,ground_node_001032,162.47549773696824,"{'residential', 'living_street'}"
+compressed_edge_000226,ground_node_000398,ground_node_001032,140.92235495356823,{'living_street'}
+compressed_edge_000227,ground_node_000399,ground_node_000580,111.78985828913827,{'living_street'}
+compressed_edge_000228,ground_node_000399,ground_node_001032,120.50493143143152,{'living_street'}
+compressed_edge_000229,ground_node_000400,ground_node_000459,43.237380728012944,{'living_street'}
+compressed_edge_000230,ground_node_000400,ground_node_001032,96.83181835331729,{'living_street'}
+compressed_edge_000233,ground_node_000402,ground_node_000626,96.54018949279522,{'service'}
+compressed_edge_000234,ground_node_000402,ground_node_000580,148.5015120550877,{'residential'}
+compressed_edge_000237,ground_node_000407,ground_node_000409,226.92286855214792,{'residential'}
+compressed_edge_000238,ground_node_000409,ground_node_000411,558.1717047834154,{'residential'}
+compressed_edge_000239,ground_node_000411,ground_node_000417,70.02076826742275,{'residential'}
+compressed_edge_000240,ground_node_000413,ground_node_000417,59.3076197653966,{'residential'}
+compressed_edge_000241,ground_node_000413,ground_node_000416,202.71302262826842,{'residential'}
+compressed_edge_000244,ground_node_000414,ground_node_000623,361.66592866058966,{'residential'}
+compressed_edge_000245,ground_node_000416,ground_node_000633,205.27219081822864,{'residential'}
+compressed_edge_000246,ground_node_000416,ground_node_000417,252.66472124756538,{'residential'}
+compressed_edge_000247,ground_node_000422,ground_node_000998,63.333162683061374,"{'living_street', 'secondary'}"
+compressed_edge_000248,ground_node_000424,ground_node_000432,80.20594226576155,{'living_street'}
+compressed_edge_000249,ground_node_000424,ground_node_000425,100.49008849348496,{'living_street'}
+compressed_edge_000250,ground_node_000425,ground_node_001034,82.7476279731234,"{'footway', 'secondary'}"
+compressed_edge_000251,ground_node_000425,ground_node_000995,149.9558245247465,"{'living_street', 'secondary'}"
+compressed_edge_000253,ground_node_000425,ground_node_000440,268.3480029952778,"{'residential', 'secondary'}"
+compressed_edge_000254,ground_node_000427,ground_node_001046,99.54142166523826,{'service'}
+compressed_edge_000255,ground_node_000427,ground_node_001011,252.96135803719602,{'service'}
+compressed_edge_000256,ground_node_000432,ground_node_000990,61.98109518401217,{'living_street'}
+compressed_edge_000257,ground_node_000432,ground_node_001034,91.03364525858933,{'footway'}
+compressed_edge_000258,ground_node_000440,ground_node_000441,66.42626490883451,{'service'}
+compressed_edge_000259,ground_node_000440,ground_node_000056,132.44296105382406,"{'residential', 'secondary'}"
+compressed_edge_000260,ground_node_000440,ground_node_000463,121.12757788311944,{'residential'}
+compressed_edge_000261,ground_node_000440,ground_node_000995,139.41616352336217,"{'residential', 'living_street', 'secondary'}"
+compressed_edge_000262,ground_node_000441,ground_node_001040,64.09396934778312,"{'service', 'primary'}"
+compressed_edge_000264,ground_node_000443,ground_node_001039,59.2945377364463,"{'footway', 'service'}"
+compressed_edge_000265,ground_node_000443,ground_node_001046,61.45051997454106,{'service'}
+compressed_edge_000266,ground_node_000444,ground_node_001046,36.12716300595346,{'service'}
+compressed_edge_000267,ground_node_000444,ground_node_001039,36.761066532700674,{'service'}
+compressed_edge_000270,ground_node_000446,ground_node_000454,119.08874352725728,{'living_street'}
+compressed_edge_000271,ground_node_000447,ground_node_000449,50.71689532992841,{'living_street'}
+compressed_edge_000272,ground_node_000447,ground_node_000451,67.05661231463692,{'living_street'}
+compressed_edge_000273,ground_node_000448,ground_node_000455,46.84815183831195,{'living_street'}
+compressed_edge_000274,ground_node_000448,ground_node_000487,51.288152328288916,{'living_street'}
+compressed_edge_000275,ground_node_000448,ground_node_000460,149.9055000089097,{'living_street'}
+compressed_edge_000276,ground_node_000449,ground_node_000455,129.77927726205425,{'living_street'}
+compressed_edge_000277,ground_node_000450,ground_node_000451,119.7976865766594,{'living_street'}
+compressed_edge_000278,ground_node_000451,ground_node_000454,59.412658758869945,{'living_street'}
+compressed_edge_000279,ground_node_000452,ground_node_000457,38.1623203394583,{'living_street'}
+compressed_edge_000280,ground_node_000452,ground_node_000453,135.1597544166141,{'living_street'}
+compressed_edge_000281,ground_node_000452,ground_node_000056,272.6811139850914,"{'footway', 'living_street', 'secondary'}"
+compressed_edge_000283,ground_node_000454,ground_node_000455,36.496179374899775,{'living_street'}
+compressed_edge_000284,ground_node_000457,ground_node_001041,75.99326315356794,{'living_street'}
+compressed_edge_000285,ground_node_000457,ground_node_001040,149.80141760658302,{'service'}
+compressed_edge_000290,ground_node_000459,ground_node_000487,90.01574343277909,{'living_street'}
+compressed_edge_000291,ground_node_000460,ground_node_000491,141.6506470717698,{'living_street'}
+compressed_edge_000292,ground_node_000462,ground_node_000493,57.09144552603867,{'living_street'}
+compressed_edge_000293,ground_node_000462,ground_node_000494,127.46557329052871,{'living_street'}
+compressed_edge_000294,ground_node_000462,ground_node_001041,178.543011184926,{'living_street'}
+compressed_edge_000295,ground_node_000463,ground_node_001045,96.81678431559864,{'living_street'}
+compressed_edge_000296,ground_node_000466,ground_node_001049,38.79894632276507,{'service'}
+compressed_edge_000297,ground_node_000466,ground_node_000473,108.80400516665784,{'footway'}
+compressed_edge_000298,ground_node_000468,ground_node_001015,47.524894977414206,{'service'}
+compressed_edge_000299,ground_node_000468,ground_node_000469,232.95540756955086,{'service'}
+compressed_edge_000300,ground_node_000469,ground_node_000473,35.70616644212004,{'footway'}
+compressed_edge_000301,ground_node_000469,ground_node_000218,147.28169982046202,"{'footway', 'service'}"
+compressed_edge_000302,ground_node_000473,ground_node_001049,69.83238924140201,{'service'}
+compressed_edge_000303,ground_node_000483,ground_node_000518,86.88186979269295,{'primary'}
+compressed_edge_000306,ground_node_000483,ground_node_000946,762.9260417683968,{'primary_link'}
+compressed_edge_000309,ground_node_000487,ground_node_000488,196.25908854187708,{'living_street'}
+compressed_edge_000311,ground_node_000489,ground_node_001044,61.57859721604325,{'living_street'}
+compressed_edge_000312,ground_node_000489,ground_node_000491,78.47864261341724,{'living_street'}
+compressed_edge_000313,ground_node_000491,ground_node_000492,202.1459065786491,{'living_street'}
+compressed_edge_000319,ground_node_000498,ground_node_000500,42.72691391476703,{'service'}
+compressed_edge_000320,ground_node_000498,ground_node_000503,142.32794772548183,{'service'}
+compressed_edge_000321,ground_node_000500,ground_node_000509,36.42364730783397,{'service'}
+compressed_edge_000322,ground_node_000500,ground_node_000505,47.85077077568911,{'service'}
+compressed_edge_000324,ground_node_000503,ground_node_000509,160.25798410449454,{'service'}
+compressed_edge_000325,ground_node_000505,ground_node_000510,53.43549775912016,{'service'}
+compressed_edge_000326,ground_node_000509,ground_node_000510,64.32294936752223,{'service'}
+compressed_edge_000327,ground_node_000513,ground_node_000514,104.19451240357336,{'service'}
+compressed_edge_000328,ground_node_000513,ground_node_000549,131.54041552308004,{'service'}
+compressed_edge_000329,ground_node_000513,ground_node_000590,305.15250482225804,{'service'}
+compressed_edge_000331,ground_node_000516,ground_node_001057,187.37394473925445,"{'primary', 'tertiary'}"
+compressed_edge_000332,ground_node_000516,ground_node_001050,554.4091648808723,"{'tertiary', 'primary', 'secondary'}"
+compressed_edge_000334,ground_node_000516,ground_node_000561,727.2586651918164,"{'primary', 'tertiary'}"
+compressed_edge_000336,ground_node_000517,ground_node_000518,281.9250487535714,{'living_street'}
+compressed_edge_000337,ground_node_000518,ground_node_001054,150.35670175021204,{'primary'}
+compressed_edge_000338,ground_node_000520,ground_node_000529,78.68291037637789,{'service'}
+compressed_edge_000339,ground_node_000520,ground_node_000522,98.97963063821075,{'service'}
+compressed_edge_000340,ground_node_000520,ground_node_000716,183.41394281863992,"{'footway', 'service'}"
+compressed_edge_000341,ground_node_000520,ground_node_001052,186.96016579833534,{'service'}
+compressed_edge_000342,ground_node_000522,ground_node_000248,120.88768857094287,{'service'}
+compressed_edge_000343,ground_node_000522,ground_node_000716,161.58467882278555,"{'footway', 'service'}"
+compressed_edge_000344,ground_node_000522,ground_node_001052,168.2308777389262,{'service'}
+compressed_edge_000345,ground_node_000522,ground_node_000529,177.01506421500994,{'service'}
+compressed_edge_000347,ground_node_000529,ground_node_000532,50.04127735595683,{'service'}
+compressed_edge_000348,ground_node_000529,ground_node_001052,108.88866501726145,{'service'}
+compressed_edge_000349,ground_node_000529,ground_node_000716,158.79145806227498,"{'footway', 'service'}"
+compressed_edge_000350,ground_node_000529,ground_node_001023,202.29096748719041,{'service'}
+compressed_edge_000351,ground_node_000532,ground_node_000726,144.25515416151345,{'service'}
+compressed_edge_000352,ground_node_000532,ground_node_001052,148.16197040435628,{'service'}
+compressed_edge_000353,ground_node_000532,ground_node_001061,160.48692698624234,{'service'}
+compressed_edge_000354,ground_node_000534,ground_node_000540,42.14184809573936,{'service'}
+compressed_edge_000355,ground_node_000534,ground_node_000541,80.611524078943,{'service'}
+compressed_edge_000356,ground_node_000534,ground_node_000535,120.20906040284243,{'service'}
+compressed_edge_000357,ground_node_000535,ground_node_000947,93.07305342658275,{'tertiary'}
+compressed_edge_000359,ground_node_000540,ground_node_000948,49.92220577572137,{'service'}
+compressed_edge_000360,ground_node_000541,ground_node_001054,112.56556034185924,"{'footway', 'primary'}"
+compressed_edge_000361,ground_node_000541,ground_node_001083,184.21007078616006,{'primary'}
+compressed_edge_000364,ground_node_000549,ground_node_000672,201.04980918134632,{'service'}
+compressed_edge_000366,ground_node_000556,ground_node_000675,103.77676849516682,{'unclassified'}
+compressed_edge_000368,ground_node_000561,ground_node_001050,213.2833244752421,"{'tertiary', 'secondary'}"
+compressed_edge_000369,ground_node_000561,ground_node_000979,309.7888243057999,{'tertiary'}
+compressed_edge_000370,ground_node_000561,ground_node_001058,414.20851588795927,"{'primary', 'tertiary'}"
+compressed_edge_000371,ground_node_000561,ground_node_001057,569.6867557961881,"{'primary', 'tertiary'}"
+compressed_edge_000376,ground_node_000576,ground_node_000611,395.2903463921558,"{'service', 'footway', 'primary'}"
+compressed_edge_000378,ground_node_000581,ground_node_000588,111.99265247498118,"{'residential', 'tertiary'}"
+compressed_edge_000379,ground_node_000581,ground_node_000402,239.12892001331082,"{'residential', 'tertiary'}"
+compressed_edge_000381,ground_node_000588,ground_node_000595,130.72396087833937,"{'footway', 'service'}"
+compressed_edge_000382,ground_node_000588,ground_node_001059,169.4033986717693,{'service'}
+compressed_edge_000383,ground_node_000590,ground_node_000595,52.983621536735065,{'service'}
+compressed_edge_000384,ground_node_000595,ground_node_000607,46.30574347446817,{'service'}
+compressed_edge_000385,ground_node_000598,ground_node_000600,45.40438126314969,{'service'}
+compressed_edge_000386,ground_node_000598,ground_node_001059,45.54276326330353,{'service'}
+compressed_edge_000387,ground_node_000598,ground_node_000607,74.44945446831485,{'service'}
+compressed_edge_000388,ground_node_000598,ground_node_000601,84.20690714765982,{'service'}
+compressed_edge_000389,ground_node_000600,ground_node_000601,58.418108672373066,{'service'}
+compressed_edge_000390,ground_node_000600,ground_node_000605,60.24872946145717,{'service'}
+compressed_edge_000391,ground_node_000600,ground_node_000607,71.99833372396284,{'service'}
+compressed_edge_000392,ground_node_000600,ground_node_000609,105.80527456867846,{'service'}
+compressed_edge_000393,ground_node_000601,ground_node_000610,57.25245596277687,{'service'}
+compressed_edge_000394,ground_node_000601,ground_node_000605,99.06264443369716,{'service'}
+compressed_edge_000395,ground_node_000604,ground_node_000609,45.911052592598374,{'service'}
+compressed_edge_000396,ground_node_000604,ground_node_000618,64.02797255912509,{'service'}
+compressed_edge_000397,ground_node_000604,ground_node_000621,100.28903486552426,{'service'}
+compressed_edge_000398,ground_node_000604,ground_node_000606,109.39274829999913,{'service'}
+compressed_edge_000399,ground_node_000605,ground_node_000610,46.91776639552213,{'service'}
+compressed_edge_000400,ground_node_000605,ground_node_000609,56.01604024025261,{'service'}
+compressed_edge_000401,ground_node_000605,ground_node_000598,104.96481632260057,{'service'}
+compressed_edge_000402,ground_node_000606,ground_node_000610,58.94363846156877,{'service'}
+compressed_edge_000403,ground_node_000606,ground_node_000611,70.66765023479056,{'service'}
+compressed_edge_000404,ground_node_000606,ground_node_000621,90.32571569242172,"{'service', 'path'}"
+compressed_edge_000405,ground_node_000606,ground_node_000629,135.8189402652531,{'service'}
+compressed_edge_000406,ground_node_000607,ground_node_000609,80.25922494576812,{'service'}
+compressed_edge_000407,ground_node_000611,ground_node_000629,125.57202678659057,{'service'}
+compressed_edge_000408,ground_node_000611,ground_node_000626,150.79639829550328,{'service'}
+compressed_edge_000409,ground_node_000611,ground_node_001059,222.10423662935432,"{'footway', 'service'}"
+compressed_edge_000410,ground_node_000611,ground_node_000659,236.68712198246078,{'service'}
+compressed_edge_000411,ground_node_000621,ground_node_000673,36.32882071455569,{'service'}
+compressed_edge_000412,ground_node_000622,ground_node_000623,91.48041142497732,{'residential'}
+compressed_edge_000413,ground_node_000629,ground_node_000673,85.038663638311,{'service'}
+compressed_edge_000414,ground_node_000629,ground_node_000666,128.01256935442257,{'service'}
+compressed_edge_000415,ground_node_000629,ground_node_001059,329.15089387310434,"{'footway', 'service'}"
+compressed_edge_000416,ground_node_000633,ground_node_000654,90.98490028362521,{'primary'}
+compressed_edge_000417,ground_node_000634,ground_node_000638,70.5868253895788,"{'footway', 'path'}"
+compressed_edge_000418,ground_node_000634,ground_node_000639,85.13885638828012,{'path'}
+compressed_edge_000419,ground_node_000634,ground_node_000643,258.63994804443973,{'path'}
+compressed_edge_000420,ground_node_000638,ground_node_000639,63.36972828625198,{'footway'}
+compressed_edge_000421,ground_node_000638,ground_node_000647,102.51720742027487,"{'footway', 'path'}"
+compressed_edge_000422,ground_node_000639,ground_node_000644,61.5951950451313,"{'footway', 'path'}"
+compressed_edge_000423,ground_node_000643,ground_node_000654,71.2002840346527,{'path'}
+compressed_edge_000424,ground_node_000643,ground_node_000655,104.68781101504071,{'path'}
+compressed_edge_000425,ground_node_000643,ground_node_000647,162.7678813914302,"{'footway', 'path'}"
+compressed_edge_000426,ground_node_000644,ground_node_000647,50.10088051334398,{'footway'}
+compressed_edge_000427,ground_node_000647,ground_node_000655,116.07246840936021,"{'footway', 'path'}"
+compressed_edge_000428,ground_node_000652,ground_node_000654,58.2676028375808,{'primary'}
+compressed_edge_000429,ground_node_000652,ground_node_000655,128.64066557391894,{'primary'}
+compressed_edge_000431,ground_node_000659,ground_node_000665,102.4684267457594,{'unclassified'}
+compressed_edge_000432,ground_node_000665,ground_node_000675,139.9378757277457,{'unclassified'}
+compressed_edge_000433,ground_node_000665,ground_node_000682,186.21009166982063,"{'unclassified', 'residential'}"
+compressed_edge_000434,ground_node_000665,ground_node_000680,302.19726911214605,{'unclassified'}
+compressed_edge_000435,ground_node_000666,ground_node_000673,74.99053658841605,{'service'}
+compressed_edge_000436,ground_node_000666,ground_node_000672,238.33190236362566,{'service'}
+compressed_edge_000437,ground_node_000675,ground_node_000680,185.6125804960262,{'unclassified'}
+compressed_edge_000438,ground_node_000695,ground_node_001019,36.88982096387199,{'footway'}
+compressed_edge_000439,ground_node_000696,ground_node_001019,67.7107316650365,{'footway'}
+compressed_edge_000440,ground_node_000697,ground_node_000701,81.9017396630779,{'service'}
+compressed_edge_000441,ground_node_000697,ground_node_000753,155.3315271390404,"{'footway', 'residential', 'service'}"
+compressed_edge_000442,ground_node_000697,ground_node_000737,176.89708204265906,"{'footway', 'service'}"
+compressed_edge_000443,ground_node_000701,ground_node_000753,85.06708636552708,{'residential'}
+compressed_edge_000444,ground_node_000701,ground_node_000737,156.38443963163564,"{'footway', 'residential'}"
+compressed_edge_000445,ground_node_000716,ground_node_001061,117.10675874253913,{'footway'}
+compressed_edge_000446,ground_node_000716,ground_node_001052,129.67474722866848,{'footway'}
+compressed_edge_000447,ground_node_000716,ground_node_000248,147.01230733896662,"{'footway', 'service'}"
+compressed_edge_000448,ground_node_000716,ground_node_001019,153.85949582698714,{'footway'}
+compressed_edge_000449,ground_node_000726,ground_node_001052,85.41626665107636,{'service'}
+compressed_edge_000450,ground_node_000726,ground_node_001061,98.02097033334641,"{'footway', 'service'}"
+compressed_edge_000451,ground_node_000726,ground_node_000741,156.69760258062212,{'service'}
+compressed_edge_000452,ground_node_000726,ground_node_000815,211.73334683679496,"{'footway', 'service'}"
+compressed_edge_000453,ground_node_000733,ground_node_001023,72.21047082518989,{'service'}
+compressed_edge_000454,ground_node_000733,ground_node_000737,107.44659739120803,{'service'}
+compressed_edge_000455,ground_node_000733,ground_node_001063,135.42993545215228,"{'footway', 'service'}"
+compressed_edge_000456,ground_node_000737,ground_node_000738,44.026942073423726,{'service'}
+compressed_edge_000457,ground_node_000737,ground_node_001063,57.016049210674176,{'service'}
+compressed_edge_000458,ground_node_000737,ground_node_000753,117.2417702215817,"{'footway', 'residential'}"
+compressed_edge_000459,ground_node_000738,ground_node_000741,73.35177200559549,{'service'}
+compressed_edge_000460,ground_node_000738,ground_node_000753,94.60652045838063,"{'residential', 'service'}"
+compressed_edge_000461,ground_node_000738,ground_node_000756,139.52967919922725,{'service'}
+compressed_edge_000462,ground_node_000741,ground_node_000809,53.23453722299228,{'service'}
+compressed_edge_000463,ground_node_000741,ground_node_001063,95.39705441453611,{'footway'}
+compressed_edge_000464,ground_node_000741,ground_node_000815,153.93112838475858,"{'footway', 'service'}"
+compressed_edge_000465,ground_node_000741,ground_node_001061,183.74719223276236,"{'footway', 'service'}"
+compressed_edge_000466,ground_node_000753,ground_node_000756,70.55422381936545,"{'residential', 'service'}"
+compressed_edge_000467,ground_node_000753,ground_node_000788,102.62618892905319,{'residential'}
+compressed_edge_000468,ground_node_000754,ground_node_000788,65.44451218517973,{'residential'}
+compressed_edge_000469,ground_node_000754,ground_node_001072,95.3314844360068,{'residential'}
+compressed_edge_000470,ground_node_000754,ground_node_000755,105.00200665418352,{'service'}
+compressed_edge_000471,ground_node_000755,ground_node_000793,62.44853326724115,{'service'}
+compressed_edge_000472,ground_node_000755,ground_node_000761,83.6943178795994,{'service'}
+compressed_edge_000473,ground_node_000755,ground_node_001072,197.42875097961053,"{'footway', 'service'}"
+compressed_edge_000474,ground_node_000756,ground_node_000817,148.12893904688443,{'service'}
+compressed_edge_000475,ground_node_000756,ground_node_001072,182.72737333727162,"{'footway', 'service'}"
+compressed_edge_000476,ground_node_000756,ground_node_000820,275.695959612666,"{'footway', 'service'}"
+compressed_edge_000477,ground_node_000761,ground_node_000788,93.58938817762316,{'residential'}
+compressed_edge_000478,ground_node_000777,ground_node_000947,71.17075464663027,{'service'}
+compressed_edge_000479,ground_node_000777,ground_node_000783,77.20501198994349,{'service'}
+compressed_edge_000480,ground_node_000777,ground_node_000741,271.89236168524815,"{'footway', 'service'}"
+compressed_edge_000481,ground_node_000777,ground_node_000726,307.8428215810289,"{'footway', 'service'}"
+compressed_edge_000482,ground_node_000783,ground_node_000815,39.664886714041266,{'service'}
+compressed_edge_000483,ground_node_000783,ground_node_000741,192.74589920237187,"{'footway', 'service'}"
+compressed_edge_000484,ground_node_000783,ground_node_000726,228.69635909815258,"{'footway', 'service'}"
+compressed_edge_000485,ground_node_000783,ground_node_001061,254.56704097223468,"{'footway', 'service'}"
+compressed_edge_000486,ground_node_000809,ground_node_000884,81.9243615486869,{'service'}
+compressed_edge_000487,ground_node_000815,ground_node_001061,237.604028710877,"{'footway', 'service'}"
+compressed_edge_000488,ground_node_000815,ground_node_001023,330.75513229638693,"{'footway', 'service'}"
+compressed_edge_000489,ground_node_000817,ground_node_000887,100.9920761488202,{'service'}
+compressed_edge_000490,ground_node_000817,ground_node_000820,142.382325270959,{'service'}
+compressed_edge_000491,ground_node_000817,ground_node_001072,207.1753171938553,"{'footway', 'service'}"
+compressed_edge_000492,ground_node_000820,ground_node_000825,41.02127401263431,{'service'}
+compressed_edge_000493,ground_node_000820,ground_node_000886,78.79990028157786,{'service'}
+compressed_edge_000494,ground_node_000825,ground_node_001072,47.41121626146325,{'residential'}
+compressed_edge_000495,ground_node_000827,ground_node_000886,38.40331631543192,{'service'}
+compressed_edge_000496,ground_node_000827,ground_node_000890,203.14996335341237,{'primary'}
+compressed_edge_000497,ground_node_000827,ground_node_000831,141.70296141581534,{'residential'}
+compressed_edge_000498,ground_node_000827,ground_node_000830,328.5480609443098,"{'residential', 'primary'}"
+compressed_edge_000499,ground_node_000828,ground_node_000901,50.33922322141128,{'primary'}
+compressed_edge_000501,ground_node_000828,ground_node_000903,132.588937259326,"{'primary', 'living_street'}"
+compressed_edge_000503,ground_node_000830,ground_node_000927,95.89806010405104,{'residential'}
+compressed_edge_000504,ground_node_000830,ground_node_000891,149.38707169994808,{'residential'}
+compressed_edge_000505,ground_node_000830,ground_node_000890,163.27627701382187,"{'residential', 'primary'}"
+compressed_edge_000506,ground_node_000831,ground_node_000927,130.3552941027264,{'residential'}
+compressed_edge_000507,ground_node_000864,ground_node_000561,926.646082122131,{'living_street'}
+compressed_edge_000508,ground_node_000884,ground_node_000887,95.70561148522705,{'service'}
+compressed_edge_000509,ground_node_000887,ground_node_000888,93.73555145619268,{'service'}
+compressed_edge_000510,ground_node_000888,ground_node_000890,42.13317696889961,{'service'}
+compressed_edge_000511,ground_node_000891,ground_node_001082,130.81979834115953,{'residential'}
+compressed_edge_000512,ground_node_000891,ground_node_000895,182.08973688018776,{'residential'}
+compressed_edge_000513,ground_node_000891,ground_node_000893,229.87167745486252,{'residential'}
+compressed_edge_000514,ground_node_000893,ground_node_001081,54.05142697125494,"{'service', 'primary'}"
+compressed_edge_000517,ground_node_000895,ground_node_001080,35.68257321542886,{'residential'}
+compressed_edge_000518,ground_node_000895,ground_node_000903,298.9130301374587,"{'primary', 'residential', 'living_street'}"
+compressed_edge_000520,ground_node_000895,ground_node_000975,661.1403004602253,{'primary'}
+compressed_edge_000521,ground_node_000901,ground_node_000903,128.43915971546284,"{'primary', 'living_street'}"
+compressed_edge_000522,ground_node_000901,ground_node_001083,281.0246408735219,{'primary'}
+compressed_edge_000523,ground_node_000901,ground_node_000982,445.33481178468844,{'primary'}
+compressed_edge_000524,ground_node_000901,ground_node_000973,494.70113703305753,{'primary'}
+compressed_edge_000525,ground_node_000903,ground_node_000982,426.73825997359165,"{'primary', 'living_street'}"
+compressed_edge_000526,ground_node_000903,ground_node_000973,476.1045852219608,"{'primary', 'living_street'}"
+compressed_edge_000527,ground_node_000903,ground_node_000975,622.555202527402,"{'primary', 'living_street'}"
+compressed_edge_000528,ground_node_000908,ground_node_001081,121.4119795590938,{'primary'}
+compressed_edge_000529,ground_node_000908,ground_node_001082,345.89592560446613,"{'residential', 'tertiary'}"
+compressed_edge_000530,ground_node_000909,ground_node_000913,89.39248823019061,{'living_street'}
+compressed_edge_000531,ground_node_000909,ground_node_000910,214.20853667456197,{'living_street'}
+compressed_edge_000532,ground_node_000909,ground_node_000957,227.40514599759754,{'living_street'}
+compressed_edge_000533,ground_node_000910,ground_node_000978,113.83730001370635,{'living_street'}
+compressed_edge_000534,ground_node_000910,ground_node_000974,232.990675044937,{'living_street'}
+compressed_edge_000535,ground_node_000910,ground_node_001087,263.22044937398925,{'living_street'}
+compressed_edge_000536,ground_node_000910,ground_node_001088,280.5251255386568,{'living_street'}
+compressed_edge_000537,ground_node_000911,ground_node_001081,40.24533532736427,{'service'}
+compressed_edge_000538,ground_node_000911,ground_node_000913,98.92254798494378,{'service'}
+compressed_edge_000539,ground_node_000913,ground_node_000978,160.76163332284943,{'residential'}
+compressed_edge_000540,ground_node_000927,ground_node_001082,170.0052523314546,{'residential'}
+compressed_edge_000541,ground_node_000947,ground_node_000948,144.55330493420644,"{'service', 'tertiary'}"
+compressed_edge_000542,ground_node_000948,ground_node_001054,183.67589772682086,"{'footway', 'service'}"
+compressed_edge_000543,ground_node_000948,ground_node_001083,255.32040817112167,"{'service', 'footway', 'primary'}"
+compressed_edge_000546,ground_node_000957,ground_node_001086,135.18955070893588,"{'living_street', 'tertiary'}"
+compressed_edge_000547,ground_node_000957,ground_node_000975,498.16821210313555,"{'primary', 'living_street'}"
+compressed_edge_000548,ground_node_000962,ground_node_001086,177.27685877665448,{'tertiary'}
+compressed_edge_000549,ground_node_000962,ground_node_000979,246.14339198396863,{'tertiary'}
+compressed_edge_000550,ground_node_000967,ground_node_000483,762.9983981960353,{'primary_link'}
+compressed_edge_000553,ground_node_000973,ground_node_000975,333.694098797473,{'primary'}
+compressed_edge_000554,ground_node_000973,ground_node_000828,498.85091457692073,{'primary'}
+compressed_edge_000555,ground_node_000974,ground_node_001087,55.686624466578834,{'living_street'}
+compressed_edge_000556,ground_node_000974,ground_node_001078,59.531395919680875,{'living_street'}
+compressed_edge_000557,ground_node_000975,ground_node_001088,162.17664981782485,"{'primary', 'living_street'}"
+compressed_edge_000559,ground_node_000975,ground_node_001087,111.59609440851939,{'living_street'}
+compressed_edge_000561,ground_node_000978,ground_node_001080,131.6003138413355,{'residential'}
+compressed_edge_000562,ground_node_000979,ground_node_001088,216.90042960637692,{'living_street'}
+compressed_edge_000564,ground_node_000982,ground_node_001054,167.83477076625468,{'primary'}
+compressed_edge_000565,ground_node_000982,ground_node_001083,245.74674079768633,{'primary'}
+compressed_edge_000567,ground_node_000990,ground_node_000995,91.14963853206936,{'living_street'}
+compressed_edge_000568,ground_node_000995,ground_node_001034,87.91681037874099,"{'footway', 'living_street', 'secondary'}"
+compressed_edge_000569,ground_node_000999,ground_node_001003,78.43773744922848,{'secondary'}
+compressed_edge_000570,ground_node_000999,ground_node_001005,181.68381101261633,"{'footway', 'secondary'}"
+compressed_edge_000571,ground_node_001003,ground_node_001005,223.55619310589267,{'secondary'}
+compressed_edge_000572,ground_node_001011,ground_node_001046,169.99377726796126,{'service'}
+compressed_edge_000573,ground_node_001011,ground_node_001049,177.38038894747848,{'service'}
+compressed_edge_000574,ground_node_001017,ground_node_001018,132.01024127282187,"{'service', 'tertiary'}"
+compressed_edge_000575,ground_node_001023,ground_node_001063,121.70212114268347,"{'footway', 'service'}"
+compressed_edge_000576,ground_node_001023,ground_node_001061,131.99226010087577,"{'footway', 'service'}"
+compressed_edge_000577,ground_node_001023,ground_node_001052,144.5602485870051,"{'footway', 'service'}"
+compressed_edge_000578,ground_node_001023,ground_node_000520,280.36246826826425,{'service'}
+compressed_edge_000579,ground_node_001034,ground_node_000440,206.30898884927228,"{'footway', 'residential', 'secondary'}"
+compressed_edge_000580,ground_node_001040,ground_node_001045,102.61451672978158,"{'service', 'primary'}"
+compressed_edge_000581,ground_node_001040,ground_node_001041,236.06832639116163,"{'footway', 'living_street'}"
+compressed_edge_000582,ground_node_001041,ground_node_001044,128.97564449146725,{'living_street'}
+compressed_edge_000583,ground_node_001041,ground_node_001045,172.3828758239054,{'living_street'}
+compressed_edge_000586,ground_node_001052,ground_node_001061,59.46141815468445,{'footway'}
+compressed_edge_000587,ground_node_001054,ground_node_001058,88.73353467419808,{'primary'}
+compressed_edge_000588,ground_node_001054,ground_node_001083,107.26994540775057,{'primary'}
+compressed_edge_000590,ground_node_001058,ground_node_001083,166.64550470562975,{'primary'}
+compressed_edge_000591,ground_node_001059,ground_node_000606,274.24651732130434,"{'footway', 'service'}"
+compressed_edge_000592,ground_node_001061,ground_node_001063,155.24790945453728,{'service'}
+compressed_edge_000593,ground_node_001061,ground_node_000777,333.71350345511104,"{'footway', 'service'}"
+compressed_edge_000594,ground_node_001063,ground_node_000726,252.87675199576978,"{'footway', 'service'}"
+compressed_edge_000595,ground_node_001063,ground_node_000783,289.05107129715446,"{'footway', 'service'}"
+compressed_edge_000596,ground_node_001063,ground_node_000777,368.1975337800308,"{'footway', 'service'}"
+compressed_edge_000598,ground_node_001080,ground_node_001081,291.3786678441752,{'primary'}
+compressed_edge_000599,ground_node_001086,ground_node_001088,240.1884432228177,{'primary'}
+compressed_edge_000600,ground_node_001086,ground_node_000910,516.2093472209967,"{'primary', 'living_street', 'tertiary'}"

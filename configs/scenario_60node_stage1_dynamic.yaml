@@ -1,7 +1,0 @@
-base: scenario_60node_rainbow_test.yaml
-
-recovery:
-  rule: dynamic_insertion
-
-recovery_insertion:
-  enabled: true

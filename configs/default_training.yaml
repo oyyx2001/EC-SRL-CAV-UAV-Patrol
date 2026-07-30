@@ -1,0 +1,84 @@
+# Default training configuration for the current Xinjiekou Rainbow DQN setup.
+base: candidate_generation.yaml
+
+project:
+  name: dynamic_patrol_default
+  results_dir: results/default_training
+  tensorboard_dir: results/default_training/tensorboard
+
+# Stage 5 reward overlay.  It applies only to this current Xinjiekou-333
+# experiment and keeps the reward ledger's increment-based accounting.
+reward:
+  mode: stage5_coordinated
+  accounting_mode: interval_increment
+  stage5_references:
+    time_s: 60.0
+    return_distance_m: 1000.0
+    cav_distance_m: 1000.0
+  stage5_weights:
+    complete: 30.0
+    priority: 2.0
+    # Each expired task receives -(30 + 2 * task.priority), symmetric with
+    # the corresponding completion and priority reward.
+    timeout: 30.0
+    timeout_priority: 2.0
+    aoi: 0.001
+    flight_energy: 0.002
+    hover_energy: 0.002
+    return_distance: 1.0
+    cav_distance: 0.4
+    recovery_wait: 0.25
+    recovery_queue: 0.12
+    route_change: 0.15
+    route_reverse: 0.50
+    coordination_failure: 30.0
+
+uav_path_planning:
+  # Used in the LRU key to prevent a route from another voxel build being
+  # reused after the map has been regenerated.
+  map_version: xinjiekou_voxel_map_3d_v1
+  path_cache_max_entries: 1024
+  # A legal elevated corridor can be much longer than the cost-optimal route;
+  # retain the implementation for ablation, but keep it off in the quality
+  # comparison run.
+  enable_validated_elevated_corridor: false
+  # Weighted Euclidean ordering preserves the same voxel graph, 26-neighbour
+  # moves and corner checks, while finding a valid bounded path faster.
+  runtime_heuristic_weight: 2.0
+  planning_budget:
+    enabled: true
+    # A sampled wall-clock guard has negligible overhead; the core also
+    # enforces expanded-node ceilings exactly.
+    check_interval_expansions: 64
+    profiles:
+      materialization:
+        # Apply the requested bound to every exact leg.  A selected sortie may
+        # contain several legs, so sharing one second across the full itinerary
+        # would reject otherwise legal multi-task sorties before their later
+        # A* requests even start.
+        enforce_sortie_deadline: false
+        max_sortie_planning_time_ms: 1000.0
+        max_segment_planning_time_ms: 1000.0
+        max_expanded_nodes_per_segment: 100000
+      recovery_replan:
+        max_sortie_planning_time_ms: 500.0
+        max_segment_planning_time_ms: 500.0
+        max_expanded_nodes_per_segment: 50000
+  recovery_replanning:
+    local_connection_distance_m: 20.0
+    max_exact_replans_per_uav_per_decision: 1
+    max_exact_replans_system_per_decision: 4
+
+recovery_replanning_optimization:
+  baseline:
+    seed: 42
+    task_count: 72
+    episode_total_time_s: 377.5779963
+    voxel_astar_call_count: 178
+    voxel_astar_total_time_s: 338.019
+    simulation_and_state_update_time_s: 232.433
+    selected_sortie_materialization_time_s: 129.294
+    completion_rate: 0.9861111111
+    episode_reward: 2623.4927786225876
+    illegal_actions: 0
+    commit_failures: 0

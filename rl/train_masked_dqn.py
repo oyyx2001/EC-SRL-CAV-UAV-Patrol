@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import hashlib
 import json
 import random
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from time import perf_counter
+from typing import Any, Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -25,7 +29,7 @@ from dynamic_patrol_marl.rl.smdp import (
     NStepSMDPAccumulator,
     NStepTransition,
     one_step_smdp_target,
-    td_error_delta_t_bin,
+    stage5_td_error_delta_t_bin,
 )
 from dynamic_patrol_marl.rl.seed_scheduler import (
     CurriculumSeedScheduler,
@@ -37,6 +41,47 @@ from dynamic_patrol_marl.utils.config import load_config, project_root
 
 
 ALGORITHMS = ("dqn", "double_dqn", "dueling_double_dqn", "rainbow_dqn")
+STAGE5_EVAL_METRICS = (
+    "high_priority_response_time_s",
+    "total_hover_energy",
+    "uav_energy_per_completed_task",
+    "avg_tasks_per_sortie",
+    "uav_return_distance_m",
+    "cav_travel_distance_m",
+    "drone_wait_time_s",
+    "route_change_count",
+    "route_reversal_count",
+    "emergency_override_count",
+    "safe_plan_rate",
+    "safe_only_decision_rate",
+    "type_I_selected_rate",
+    "type_II_selected_rate",
+    "type_III_selected_rate",
+    "joint_keep_route_rate",
+    "joint_wait_rate",
+    "joint_move_to_rate",
+    "joint_reroute_rate",
+    "keep_route_count",
+    "wait_count",
+    "move_to_count",
+    "reroute_count",
+    "commit_failure_count",
+    "rollback_count",
+    "infeasible_recoveries",
+    "minimum_battery_observed",
+    "mean_plan_generation_time_ms",
+)
+
+STAGE5_EPISODE_COLUMNS = (
+    "task_release_horizon_s", "episode_end_time_s", "terminated", "truncated",
+    "released_task_count", "completed_task_count_final", "timed_out_task_count_final",
+    "pending_tasks_at_cutoff", "backlog_rate_at_cutoff", "completed_during_drain",
+    "timed_out_during_drain", "drain_duration_s", "censored_task_count",
+    "censoring_rate", "completion_rate_final", "timeout_rate_final",
+    "operation_reward", "drain_reward", "episode_reward_total",
+    "reward_per_released_task", "reward_per_operation_hour",
+)
+
 EVAL_COLUMNS = [
     "step",
     "algo",
@@ -49,7 +94,117 @@ EVAL_COLUMNS = [
     "uav_waiting_time",
     "cav_waiting_time",
     "episode_reward",
-]
+] + list(STAGE5_EVAL_METRICS) + list(STAGE5_EPISODE_COLUMNS) + ["action_entropy"]
+
+STAGE5_DT_BINS = (
+    "dt_eq_0",
+    "dt_0_10",
+    "dt_10_30",
+    "dt_30_60",
+    "dt_60_120",
+    "dt_over_120",
+)
+
+
+def reward_config_metadata(cfg: Dict) -> Dict:
+    reward_cfg = dict(cfg.get("reward", {}) or {})
+    canonical = json.dumps(reward_cfg, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    normalization = dict(reward_cfg.get("normalization", {}) or {})
+    return {
+        "config": reward_cfg,
+        "signature": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "mode": str(reward_cfg.get("mode", "legacy_interval")),
+        "scale_file": str(normalization.get("scale_file", "")),
+        "scale_version": str(normalization.get("scale_version", "")),
+    }
+
+
+def _action_entropy(metrics: Dict) -> float:
+    probabilities = np.asarray(
+        [
+            metrics.get("safe_plan_rate", 0.0),
+            metrics.get("type_I_selected_rate", 0.0),
+            metrics.get("type_II_selected_rate", 0.0),
+            metrics.get("type_III_selected_rate", 0.0),
+        ],
+        dtype=float,
+    )
+    probabilities = probabilities[np.isfinite(probabilities) & (probabilities > 0.0)]
+    return float(-np.sum(probabilities * np.log(probabilities))) if probabilities.size else 0.0
+
+
+def _safe_correlation(left: List[float], right: List[float], *, ranked: bool = False) -> float:
+    if len(left) < 2 or len(right) < 2:
+        return float("nan")
+    x = pd.Series(left, dtype=float)
+    y = pd.Series(right, dtype=float)
+    if ranked:
+        x, y = x.rank(method="average"), y.rank(method="average")
+    if x.nunique(dropna=True) < 2 or y.nunique(dropna=True) < 2:
+        return float("nan")
+    return float(x.corr(y))
+
+
+def stage5_event_categories(event_types: str, *, instantaneous_dispatch: bool = False) -> List[str]:
+    categories: List[str] = []
+    for event_type in str(event_types).split("|"):
+        event_type = event_type.strip().upper()
+        if not event_type:
+            continue
+        if event_type == "TASK_RELEASE":
+            categories.append("task_release")
+        elif event_type == "TASK_SERVICE_COMPLETE":
+            categories.append("task_completion")
+        elif event_type == "TASK_TIMEOUT":
+            categories.append("task_timeout")
+        elif event_type == "UAV_LAUNCH":
+            categories.append("uav_launch")
+        elif event_type in {"UAV_RECOVERED", "CAV_RECOVERY_COMPLETE"}:
+            categories.append("uav_recovery")
+        elif event_type in {"UAV_RECOVERY_ARRIVAL", "RECOVERY_QUEUE_UPDATED"}:
+            categories.append("queue_change")
+        elif event_type.startswith("CAV_") and "ARRIVAL" in event_type:
+            categories.append("cav_arrival")
+        elif event_type == "EPISODE_END":
+            categories.append("episode_terminal")
+    if instantaneous_dispatch:
+        categories.append("instantaneous_multi_dispatch")
+    return sorted(set(categories)) or ["other"]
+
+
+def validate_resume_checkpoint(
+    checkpoint: Dict,
+    *,
+    expected_obs_dim: int,
+    expected_action_dim: int,
+    expected_candidate_dim: int,
+    expected_decision_mode: str,
+    current_reward_metadata: Dict,
+) -> None:
+    if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+        raise ValueError("unsupported resume checkpoint")
+    expected = (
+        int(expected_obs_dim),
+        int(expected_action_dim),
+        int(expected_candidate_dim),
+        str(expected_decision_mode),
+    )
+    actual = (
+        int(checkpoint.get("obs_dim", -1)),
+        int(checkpoint.get("action_dim", -1)),
+        int(checkpoint.get("candidate_dim", -1)),
+        str(checkpoint.get("decision_mode", "")),
+    )
+    if actual != expected:
+        raise ValueError(f"resume checkpoint/environment mismatch: checkpoint={actual}, environment={expected}")
+    saved_reward = dict(checkpoint.get("reward_metadata", {}) or {})
+    if not saved_reward.get("signature"):
+        raise ValueError("resume checkpoint has no reward configuration signature")
+    if saved_reward["signature"] != current_reward_metadata["signature"]:
+        raise ValueError(
+            "resume checkpoint reward configuration mismatch: "
+            f"checkpoint={saved_reward['signature']} current={current_reward_metadata['signature']}"
+        )
 
 
 @dataclass
@@ -72,6 +227,8 @@ class DQNHyperParams:
     prioritized_replay_beta_final: float = 1.0
     prioritized_replay_beta_steps: int = 200000
     priority_epsilon: float = 1e-6
+    checkpoint_interval: int = 0
+    diagnostic_sample_stride: int = 1
 
 
 def set_global_seed(seed: int) -> None:
@@ -146,7 +303,8 @@ def select_action(
     rng: np.random.Generator,
     device: torch.device,
 ) -> int:
-    if rng.random() < float(epsilon):
+    exploring = rng.random() < float(epsilon)
+    if exploring:
         return sample_valid_action(action_mask, rng)
     obs_t = torch.as_tensor(obs[None, :], device=device, dtype=torch.float32)
     mask_t = torch.as_tensor(action_mask[None, :], device=device, dtype=torch.bool)
@@ -181,7 +339,9 @@ def compute_dqn_loss(
         discounts = getattr(batch, "bootstrap_discounts", None)
         if discounts is None:
             discounts = torch.full_like(batch.rewards, float(gamma))
-        target_q = one_step_smdp_target(batch.rewards, discounts, batch.dones, next_q)
+        # Gymnasium truncation is a time-limit cut, not a natural terminal
+        # state.  It must retain the bootstrap while ``terminated`` must not.
+        target_q = one_step_smdp_target(batch.rewards, discounts, batch.terminateds, next_q)
     per_sample_loss = nn.functional.smooth_l1_loss(current_q, target_q, reduction="none")
     if weights is not None:
         per_sample_loss = per_sample_loss * weights
@@ -190,12 +350,12 @@ def compute_dqn_loss(
 
 
 def metric_row(step: int, algo: str, seed: int, metrics: Dict, episode_reward: float) -> Dict:
-    return {
+    row = {
         "step": int(step),
         "algo": algo,
         "seed": int(seed),
-        "completion_rate": metrics.get("completion_rate", np.nan),
-        "timeout_rate": metrics.get("timeout_rate", np.nan),
+        "completion_rate": metrics.get("completion_rate_final", metrics.get("completion_rate", np.nan)),
+        "timeout_rate": metrics.get("timeout_rate_final", metrics.get("timeout_rate", np.nan)),
         "avg_response_time": metrics.get("avg_response_time_s", np.nan),
         "weighted_aoi": metrics.get("weighted_aoi", np.nan),
         "energy": metrics.get("total_energy", np.nan),
@@ -203,6 +363,10 @@ def metric_row(step: int, algo: str, seed: int, metrics: Dict, episode_reward: f
         "cav_waiting_time": metrics.get("vehicle_wait_time_s", np.nan),
         "episode_reward": float(episode_reward),
     }
+    row.update({key: metrics.get(key, np.nan) for key in STAGE5_EVAL_METRICS})
+    row.update({key: metrics.get(key, np.nan) for key in STAGE5_EPISODE_COLUMNS})
+    row["action_entropy"] = _action_entropy(metrics)
+    return row
 
 
 def train_metric_row(
@@ -218,7 +382,7 @@ def train_metric_row(
     stage: int | None = None,
     stage_name: str = "",
 ) -> Dict:
-    return {
+    row = {
         "step": int(step),
         "episode": int(episode),
         "episode_steps": int(episode_steps),
@@ -226,20 +390,31 @@ def train_metric_row(
         "epsilon": float(epsilon),
         "loss": float(latest_loss) if np.isfinite(latest_loss) else 0.0,
         "loss_available": bool(np.isfinite(latest_loss)),
-        "completion_rate": metrics.get("completion_rate", np.nan),
-        "timeout_rate": metrics.get("timeout_rate", np.nan),
+        "completion_rate": metrics.get("completion_rate_final", metrics.get("completion_rate", np.nan)),
+        "timeout_rate": metrics.get("timeout_rate_final", metrics.get("timeout_rate", np.nan)),
         "illegal_actions": metrics.get("illegal_actions", np.nan),
         "partial_episode": bool(partial_episode),
         "seed_mode": seed_mode,
         "stage": np.nan if stage is None else int(stage),
         "stage_name": stage_name,
     }
+    row.update({key: metrics.get(key, np.nan) for key in STAGE5_EVAL_METRICS})
+    row.update({key: metrics.get(key, np.nan) for key in STAGE5_EPISODE_COLUMNS})
+    row["action_entropy"] = _action_entropy(metrics)
+    return row
 
 
 def write_train_scalars(writer, row: Dict, step: int) -> None:
     writer.add_scalar("train/episode_reward", float(row["episode_reward"]), step)
     writer.add_scalar("train/completion_rate", float(row["completion_rate"]), step)
     writer.add_scalar("train/timeout_rate", float(row["timeout_rate"]), step)
+    for name in (
+        "reward_per_released_task", "reward_per_operation_hour", "backlog_rate_at_cutoff",
+        "drain_duration_s", "censoring_rate", "safe_plan_rate",
+    ):
+        value = row.get(name, np.nan)
+        if np.isfinite(value):
+            writer.add_scalar(f"train/{name}", float(value), step)
     writer.add_scalar("train/illegal_actions", float(row["illegal_actions"]), step)
     writer.add_scalar("train/episode_steps", int(row["episode_steps"]), step)
     writer.add_scalar("train/epsilon", float(row["epsilon"]), step)
@@ -280,7 +455,7 @@ def evaluate_policy(
             )
             obs, reward, done, mask, _ = step_env(env, action)
             episode_reward += reward
-        rows.append(metric_row(step, algo, int(seed), env.sim.metrics(method_name).to_dict(), episode_reward))
+        rows.append(metric_row(step, algo, int(seed), env.episode_summary(), episode_reward))
     q_network.train()
     return pd.DataFrame(rows, columns=EVAL_COLUMNS)
 
@@ -308,6 +483,9 @@ def save_outputs(
     replay_config: Dict | None = None,
     feature_schema: Dict | None = None,
     decision_mode: str = "sortie_only",
+    reward_metadata: Dict | None = None,
+    resume_from: str = "",
+    wall_clock_time_s: float = 0.0,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -332,6 +510,8 @@ def save_outputs(
             "replay_config": dict(replay_config or {}),
             "decision_mode": str(decision_mode),
             "feature_schema": dict(feature_schema or {}),
+            "reward_metadata": dict(reward_metadata or {}),
+            "resume_from": str(resume_from),
             "model_state_dict": online_net.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
         },
@@ -360,6 +540,12 @@ def save_outputs(
         "time_mode": str((replay_config or {}).get("time_mode", "fixed_interval")),
         "decision_mode": str(decision_mode),
         "feature_schema_version": int((feature_schema or {}).get("schema_version", 0)),
+        "reward_mode": str((reward_metadata or {}).get("mode", "")),
+        "reward_config_signature": str((reward_metadata or {}).get("signature", "")),
+        "reward_scale_file": str((reward_metadata or {}).get("scale_file", "")),
+        "reward_scale_version": str((reward_metadata or {}).get("scale_version", "")),
+        "resume_from": str(resume_from),
+        "wall_clock_time_s": float(wall_clock_time_s),
         **asdict(hp),
     }
     if not final_eval.empty:
@@ -377,6 +563,45 @@ def save_outputs(
     summary_df.to_csv(summary_path, index=False)
     with open(run_dir / "params.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+
+
+def save_intermediate_checkpoint(
+    *,
+    run_dir: Path,
+    step: int,
+    algo: str,
+    seed: int,
+    online_net: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    obs_dim: int,
+    action_dim: int,
+    candidate_dim: int,
+    decision_mode: str,
+    reward_metadata: Dict,
+    feature_schema: Dict,
+    hyperparams: DQNHyperParams,
+) -> Path:
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    path = checkpoint_dir / f"checkpoint_step_{int(step)}.pt"
+    torch.save(
+        {
+            "algo": algo,
+            "seed": int(seed),
+            "timesteps": int(step),
+            "obs_dim": int(obs_dim),
+            "action_dim": int(action_dim),
+            "candidate_dim": int(candidate_dim),
+            "decision_mode": str(decision_mode),
+            "feature_schema": dict(feature_schema),
+            "reward_metadata": dict(reward_metadata),
+            "hyperparams": asdict(hyperparams),
+            "model_state_dict": online_net.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        },
+        path,
+    )
+    return path
 
 
 def train_masked_dqn(
@@ -398,6 +623,10 @@ def train_masked_dqn(
     seed_mode: str | None = None,
     stage_timesteps: List[int] | None = None,
     action_masking: bool = True,
+    resume_from: Path | None = None,
+    max_episodes: int | None = None,
+    timing_out_dir: Path | None = None,
+    reward_audit_out_dir: Path | None = None,
 ) -> Path:
     if algo not in ALGORITHMS:
         raise ValueError(f"--algo must be one of {ALGORITHMS}")
@@ -436,7 +665,168 @@ def train_masked_dqn(
 
     scheduler = CurriculumSeedScheduler(stages, rng_seed=base_seed)
     env = DynamicPatrolEnv(cfg, scenario=train_scenario, seed_scheduler=scheduler)
+    if max_episodes == 1:
+        print("ENV_CREATED", flush=True)
+    timing_enabled = max_episodes is not None or timing_out_dir is not None
+    phase_names = [
+        "environment_reset_time", "observation_building_time", "task_update_time",
+        "candidate_generation_time", "candidate_feature_time", "uav_path_planning_time",
+        "selected_sortie_materialization_time", "voxel_astar_search_time",
+        "action_mask_time", "policy_inference_time", "environment_step_time",
+        "reward_calculation_time", "replay_buffer_time", "network_training_time",
+        "target_network_update_time", "logging_time", "checkpoint_time",
+    ]
+    phase_totals = {name: 0.0 for name in phase_names}
+    phase_calls = {name: 0 for name in phase_names}
+    episode_timing_rows: list[dict] = []
+    current_episode_timing = {name: 0.0 for name in phase_names}
+    current_episode_calls = {name: 0 for name in phase_names}
+    current_planner = {"calls": 0, "direct": 0, "local_detour": 0, "failed": 0, "full_time_s": 0.0, "edge_time_s": 0.0, "astar_time_s": 0.0}
+    simple_counts = {
+        "safe_plan_count": 0, "selected_uav_plan_count": 0,
+        "materialization_failure_count": 0, "voxel_astar_call_count": 0,
+        "voxel_astar_timeout_count": 0,
+    }
+    # Per-attempt diagnostics are deliberately collected at the existing
+    # commit-time materialization boundary; candidate generation remains
+    # estimate-only.  ``selected_uav_action_count`` means calls entering
+    # materialize_selected_sortie, while ``committed_uav_sortie_count`` means
+    # the returned precise sortie was subsequently accepted by commit logic.
+    materialization_attempt_rows: List[Dict[str, Any]] = []
+    astar_segment_rows: List[Dict[str, Any]] = []
+    planner_original = None
+
+    def add_phase(name: str, elapsed: float) -> None:
+        if not timing_enabled:
+            return
+        phase_totals[name] += float(elapsed)
+        phase_calls[name] += 1
+        current_episode_timing[name] += float(elapsed)
+        current_episode_calls[name] += 1
+
+    def wrap_method(obj, attr: str, phase: str) -> None:
+        original = getattr(obj, attr)
+        def timed(*args, **kwargs):
+            started = perf_counter()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                add_phase(phase, perf_counter() - started)
+        setattr(obj, attr, timed)
+
+    if timing_enabled:
+        wrap_method(env, "_observation", "observation_building_time")
+        wrap_method(env, "action_masks", "action_mask_time")
+        wrap_method(env, "_reward", "reward_calculation_time")
+        wrap_method(env, "_event_reward_components", "reward_calculation_time")
+    def install_sim_timing_wrappers() -> None:
+        if not timing_enabled or env.sim is None:
+            return
+        wrap_method(env.sim, "get_candidates", "candidate_generation_time")
+        if env.sim.joint_plan_generator is not None:
+            wrap_method(env.sim.joint_plan_generator, "generate_joint_plans", "candidate_generation_time")
+        if env.sim.task_pool is not None:
+            wrap_method(env.sim.task_pool, "update_release_and_expiry", "task_update_time")
+        if env.sim.sortie_generator is not None:
+            original_materialize = env.sim.sortie_generator.materialize_selected_sortie
+            def timed_materialize(*args, **kwargs):
+                started = perf_counter()
+                sortie_arg = args[0] if args else kwargs.get("sortie")
+                now_arg = float(args[2] if len(args) > 2 else kwargs.get("now", getattr(env.sim, "now", 0.0)))
+                attempt_id = f"episode_{episode_idx}_materialization_{len(materialization_attempt_rows)+1:04d}"
+                try:
+                    result = original_materialize(*args, **kwargs)
+                    simple_counts["selected_uav_plan_count"] += int(result is not None)
+                    simple_counts["materialization_failure_count"] += int(result is None)
+                    failure = str(getattr(env.sim.sortie_generator, "last_materialization", {}).get("failure_reason", ""))
+                    simple_counts["voxel_astar_timeout_count"] += int("timeout" in failure)
+                    meta = dict(getattr(env.sim.sortie_generator, "last_materialization", {}) or {})
+                    details = list(meta.get("segment_results", []) or [])
+                    required = len([s for s in (getattr(sortie_arg, "segments", None) or []) if str(s.get("type")) == "horizontal_flight"])
+                    success_segments = sum(bool(d.get("astar_success", d.get("cache_hit", False))) for d in details)
+                    failed_segments = len(details) - success_segments
+                    failure_stage = meta.get("failure_stage")
+                    if result is None and not failure_stage:
+                        failure_stage = "during_astar" if details else "before_astar"
+                    task_ids = list(getattr(sortie_arg, "task_ids", []) or [])
+                    attempt_row = {
+                        "episode_id": f"episode_{episode_idx}", "decision_epoch_id": len(materialization_attempt_rows),
+                        "simulation_time": now_arg, "action_slot": None, "joint_plan_id": None,
+                        "materialization_attempt_id": attempt_id, "uav_id": getattr(sortie_arg, "drone_id", None),
+                        "task_count": len(task_ids), "task_ids": ";".join(map(str, task_ids)),
+                        "task_types": None, "task_priorities": None, "task_deadlines": None,
+                        "launch_node": getattr(sortie_arg, "launch_node", None), "recovery_node": getattr(sortie_arg, "recovery_node", None),
+                        "expected_distance_before_astar_m": sum(float(s.get("distance_m", 0.0)) for s in (getattr(sortie_arg, "segments", None) or []) if s.get("type") == "horizontal_flight"),
+                        "expected_duration_before_astar_s": getattr(sortie_arg, "drone_time_s", None), "expected_energy_before_astar": getattr(sortie_arg, "energy", None),
+                        "expected_recovery_eta_before_astar": (now_arg + float(getattr(sortie_arg, "finish_time_s", now_arg) - now_arg)) if sortie_arg is not None else None,
+                        "segment_count_required": required, "astar_segments_attempted": len(details),
+                        "astar_segments_succeeded": int(success_segments), "astar_segments_failed": int(failed_segments),
+                        "exact_total_distance_m": meta.get("actual_distance_m"), "exact_total_duration_s": meta.get("actual_flight_time_s"),
+                        "exact_total_energy": getattr(result, "energy", None) if result is not None else None,
+                        "exact_recovery_eta": getattr(result, "recovery_eta", None) if result is not None else None,
+                        "materialization_success": bool(result is not None), "failure_stage": failure_stage,
+                        "failure_reason": None if result is not None else (failure or "invalid_materialization_result"),
+                        "failure_detail": None if result is not None else str(meta), "elapsed_time_ms": (perf_counter() - started) * 1000.0,
+                    }
+                    materialization_attempt_rows.append(attempt_row)
+                    for index, detail in enumerate(details):
+                        astar_segment_rows.append({
+                            "episode_id": f"episode_{episode_idx}", "decision_epoch_id": attempt_row["decision_epoch_id"], "simulation_time": now_arg,
+                            "materialization_attempt_id": attempt_id, "segment_plan_id": f"{attempt_id}_segment_{index:03d}", "segment_index": index,
+                            "segment_type": "launch_to_task" if index == 0 else ("task_to_recovery" if index == required - 1 else "task_to_task"),
+                            "origin_type": None, "origin_id": None, "origin_x": None, "origin_y": None, "origin_z": None,
+                            "destination_type": None, "destination_id": None, "destination_x": None, "destination_y": None, "destination_z": None,
+                            "euclidean_distance_m": detail.get("distance_m"), "voxel_start": detail.get("start_voxel"), "voxel_goal": detail.get("goal_voxel"),
+                            "astar_called": True, "astar_success": bool(detail.get("astar_success", detail.get("cache_hit", False))),
+                            "astar_status": detail.get("astar_status", "success"), "astar_failure_reason": None if detail.get("astar_success", detail.get("cache_hit", False)) else meta.get("failure_reason"),
+                            "planning_time_ms": float(detail.get("planning_time_s", 0.0)) * 1000.0, "expanded_nodes": detail.get("expanded_nodes"), "generated_nodes": None,
+                            "open_set_peak_size": None, "path_voxel_count": detail.get("path_voxel_count"), "path_distance_m": detail.get("distance_m"),
+                            "cache_hit": bool(detail.get("cache_hit", False)), "cache_key": None,
+                        })
+                    return result
+                finally:
+                    add_phase("selected_sortie_materialization_time", perf_counter() - started)
+            env.sim.sortie_generator.materialize_selected_sortie = timed_materialize
+
+    if timing_enabled:
+        uav_module_root = project_root() / "truck_uav_modules"
+        if str(uav_module_root) not in sys.path:
+            sys.path.insert(0, str(uav_module_root))
+        import uav_path_planner as _uav_path_planner
+        planner_original = _uav_path_planner.plan_uav_path
+        def timed_uav_path(*args, **kwargs):
+            profile = kwargs.setdefault("profile", {})
+            started = perf_counter()
+            result = planner_original(*args, **kwargs)
+            elapsed = perf_counter() - started
+            add_phase("uav_path_planning_time", elapsed)
+            current_planner["calls"] += 1
+            current_planner["full_time_s"] += elapsed
+            mode = str(result.get("path_mode", ""))
+            if mode == "direct":
+                current_planner["direct"] += 1
+            elif mode == "local_detour":
+                current_planner["local_detour"] += 1
+            if not bool(result.get("feasible")):
+                current_planner["failed"] += 1
+            current_planner["edge_time_s"] += float(profile.get("visibility_edge_construction_ms", 0.0)) / 1000.0
+            current_planner["astar_time_s"] += float(profile.get("astar_search_ms", 0.0)) / 1000.0
+            return result
+        _uav_path_planner.plan_uav_path = timed_uav_path
+        import build_and_benchmark_3d_voxel_astar as _voxel_core
+        voxel_original = _voxel_core.plan_3d_path
+        def timed_voxel_astar(*args, **kwargs):
+            started = perf_counter()
+            try:
+                simple_counts["voxel_astar_call_count"] += 1
+                return voxel_original(*args, **kwargs)
+            finally:
+                add_phase("voxel_astar_search_time", perf_counter() - started)
+        _voxel_core.plan_3d_path = timed_voxel_astar
+    reset_started = perf_counter()
     obs, mask = reset_env(env)
+    add_phase("environment_reset_time", perf_counter() - reset_started)
+    install_sim_timing_wrappers()
     obs_dim = int(env.observation_space.shape[0])
     action_dim = int(env.action_space.n)
     if env.decision_mode == "joint_plan":
@@ -452,6 +842,29 @@ def train_masked_dqn(
     target_net.load_state_dict(online_net.state_dict())
     target_net.eval()
     optimizer = torch.optim.Adam(online_net.parameters(), lr=hp.lr)
+    current_reward_metadata = reward_config_metadata(cfg)
+    resolved_resume_from = ""
+    if resume_from is not None:
+        resume_path = Path(resume_from)
+        if not resume_path.is_absolute():
+            resume_path = project_root() / resume_path
+        try:
+            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        except TypeError:  # PyTorch < 2.0
+            checkpoint = torch.load(resume_path, map_location=device)
+        validate_resume_checkpoint(
+            checkpoint,
+            expected_obs_dim=obs_dim,
+            expected_action_dim=action_dim,
+            expected_candidate_dim=int(hp.candidate_dim),
+            expected_decision_mode=env.decision_mode,
+            current_reward_metadata=current_reward_metadata,
+        )
+        online_net.load_state_dict(checkpoint["model_state_dict"])
+        target_net.load_state_dict(online_net.state_dict())
+        if checkpoint.get("optimizer_state_dict"):
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        resolved_resume_from = str(resume_path)
     time_mode = str(cfg.get("time", {}).get("mode", cfg.get("time_mode", "fixed_interval"))).lower()
     smdp_cfg = cfg.get("smdp", {})
     reference_interval_s = float(smdp_cfg.get("reference_interval_s", 60.0))
@@ -489,15 +902,34 @@ def train_masked_dqn(
     latest_loss = np.nan
     gradient_updates = 0
     training_simulated_seconds = 0.0
-    td_error_diagnostics: Dict[str, List[float]] = {
-        "delta_0_30": [],
-        "delta_30_60": [],
-        "delta_60_120": [],
-        "delta_over_120": [],
+    td_error_diagnostics = {
+        key: {
+            "transition_count": 0,
+            "rewards": [],
+            "td_errors": [],
+            "priorities": [],
+            "gradient_norms": [],
+        }
+        for key in STAGE5_DT_BINS
     }
+    all_sampled_delta_t: List[float] = []
+    all_sampled_td_error: List[float] = []
+    replay_event_counts: Counter[str] = Counter()
+    sampled_event_counts: Counter[str] = Counter()
+    reward_component_sums: Counter[str] = Counter()
+    reward_component_nonzero: Counter[str] = Counter()
+    reward_component_transitions = 0
+    nonfinite_loss_count = 0
+    nonfinite_gradient_count = 0
+    maximum_gradient_norm = 0.0
+    gradient_norm_history: List[float] = []
+    training_started_at = perf_counter()
     stage_end_steps = np.cumsum([int(stage.timesteps) for stage in stages]).tolist()
     current_stage_idx = 0
     scheduler.set_stage(current_stage_idx)
+    episode_wall_started = perf_counter()
+    if max_episodes == 1:
+        print("EPISODE_STARTED", flush=True)
     print(
         f"DQN seed_mode={resolved_seed_mode}; mask_mode={'masked' if action_masking else 'unmasked'}; "
         f"stage 1/{len(stages)} {stages[0].name}, seeds={stages[0].seed_pool}, timesteps={stages[0].timesteps}"
@@ -517,8 +949,22 @@ def train_masked_dqn(
         if algo == "rainbow_dqn":
             reset_noisy_layers(online_net)
         stored_mask = policy_action_mask(mask, action_masking)
+        policy_started = perf_counter()
         action = select_action(online_net, obs, stored_mask, epsilon, rng, device)
+        simple_counts["safe_plan_count"] += int(action == 0)
+        add_phase("policy_inference_time", perf_counter() - policy_started)
+        step_started = perf_counter()
         next_obs, reward, done, next_mask, transition_info = step_env(env, action)
+        add_phase("environment_step_time", perf_counter() - step_started)
+        ledger_values = dict(transition_info.get("reward_ledger_components", {}) or {})
+        if ledger_values:
+            reward_component_transitions += 1
+            for name, value in ledger_values.items():
+                number = float(value)
+                if not np.isfinite(number):
+                    raise FloatingPointError(f"non-finite reward component {name} at step {step}: {number}")
+                reward_component_sums[name] += number
+                reward_component_nonzero[name] += int(abs(number) > 1e-12)
         if time_mode == "event_driven":
             delta_t = float(transition_info["delta_t"])
             bootstrap_discount = float(transition_info["transition_discount"])
@@ -541,7 +987,14 @@ def train_masked_dqn(
             trigger_event_type="|".join(transition_info.get("trigger_events", [])),
             instantaneous_dispatch=bool(transition_info.get("instantaneous_dispatch", False)),
         )
+        replay_started = perf_counter()
         for stored_transition in n_step_accumulator.append(raw_transition):
+            replay_event_counts.update(
+                stage5_event_categories(
+                    stored_transition.trigger_event_type,
+                    instantaneous_dispatch=stored_transition.instantaneous_dispatch,
+                )
+            )
             replay.add(
                 stored_transition.obs,
                 stored_transition.action,
@@ -558,6 +1011,7 @@ def train_masked_dqn(
                 trigger_event_type=stored_transition.trigger_event_type,
                 instantaneous_dispatch=stored_transition.instantaneous_dispatch,
             )
+        add_phase("replay_buffer_time", perf_counter() - replay_started)
 
         obs = next_obs
         mask = next_mask
@@ -569,6 +1023,7 @@ def train_masked_dqn(
             and len(replay) >= hp.batch_size
             and step % max(1, int(hp.train_frequency)) == 0
         ):
+            network_started = perf_counter()
             if algo == "rainbow_dqn":
                 reset_noisy_layers(online_net)
                 batch = replay.sample(hp.batch_size, device, beta=prioritized_beta_by_step(step, hp))
@@ -584,25 +1039,88 @@ def train_masked_dqn(
                 weights=weights,
                 action_masking=action_masking,
             )
+            if not bool(torch.isfinite(loss).item()) or not bool(torch.isfinite(td_errors).all().item()):
+                nonfinite_loss_count += 1
+                raise FloatingPointError(f"non-finite loss or TD-error at training step {step}")
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(online_net.parameters(), hp.max_grad_norm)
+            gradient_norm = float(nn.utils.clip_grad_norm_(online_net.parameters(), hp.max_grad_norm).item())
+            if not np.isfinite(gradient_norm):
+                nonfinite_gradient_count += 1
+                raise FloatingPointError(f"non-finite gradient norm at training step {step}")
+            maximum_gradient_norm = max(maximum_gradient_norm, gradient_norm)
+            gradient_norm_history.append(gradient_norm)
             optimizer.step()
             gradient_updates += 1
             if algo == "rainbow_dqn" and batch.indices is not None:
                 replay.update_priorities(batch.indices, td_errors)
-            for duration, error in zip(
-                batch.delta_ts.detach().cpu().numpy(),
-                td_errors.detach().abs().cpu().numpy(),
-            ):
-                td_error_diagnostics[td_error_delta_t_bin(float(duration))].append(float(error))
+            durations = batch.delta_ts.detach().cpu().numpy()
+            absolute_errors = td_errors.detach().abs().cpu().numpy()
+            sampled_rewards = batch.rewards.detach().cpu().numpy()
+            sampled_priorities = (
+                batch.sampled_priorities.detach().cpu().numpy()
+                if batch.sampled_priorities is not None
+                else np.full_like(absolute_errors, np.nan, dtype=float)
+            )
+            labels = np.asarray([stage5_td_error_delta_t_bin(float(value)) for value in durations])
+            for label in STAGE5_DT_BINS:
+                td_error_diagnostics[label]["transition_count"] += int(np.sum(labels == label))
+            capture_diagnostics = gradient_updates % max(1, int(hp.diagnostic_sample_stride)) == 0
+            if capture_diagnostics:
+                all_sampled_delta_t.extend(float(value) for value in durations)
+                all_sampled_td_error.extend(float(value) for value in absolute_errors)
+                for label in STAGE5_DT_BINS:
+                    selected = labels == label
+                    if not selected.any():
+                        continue
+                    bucket = td_error_diagnostics[label]
+                    bucket["rewards"].extend(float(value) for value in sampled_rewards[selected])
+                    bucket["td_errors"].extend(float(value) for value in absolute_errors[selected])
+                    bucket["priorities"].extend(
+                        float(value) for value in sampled_priorities[selected] if np.isfinite(value)
+                    )
+                    bucket["gradient_norms"].extend([gradient_norm] * int(np.sum(selected)))
+            if capture_diagnostics and batch.trigger_event_types is not None:
+                instantaneous = batch.instantaneous_dispatches.detach().cpu().numpy()
+                for event_types, is_instantaneous in zip(batch.trigger_event_types, instantaneous):
+                    sampled_event_counts.update(
+                        stage5_event_categories(
+                            str(event_types), instantaneous_dispatch=bool(is_instantaneous)
+                        )
+                    )
             latest_loss = float(loss.item())
+            add_phase("network_training_time", perf_counter() - network_started)
 
         if step % hp.target_update_interval == 0:
+            target_started = perf_counter()
             target_net.load_state_dict(online_net.state_dict())
+            add_phase("target_network_update_time", perf_counter() - target_started)
+
+        if hp.checkpoint_interval > 0 and step % int(hp.checkpoint_interval) == 0 and step < effective_timesteps:
+            checkpoint_started = perf_counter()
+            save_intermediate_checkpoint(
+                run_dir=run_dir,
+                step=step,
+                algo=algo,
+                seed=base_seed,
+                online_net=online_net,
+                optimizer=optimizer,
+                obs_dim=obs_dim,
+                action_dim=action_dim,
+                candidate_dim=int(hp.candidate_dim),
+                decision_mode=env.decision_mode,
+                reward_metadata=current_reward_metadata,
+                feature_schema=(
+                    env.sim.joint_plan_generator.feature_builder.schema()
+                    if env.sim is not None and env.sim.joint_plan_generator is not None
+                    else {}
+                ),
+                hyperparams=hp,
+            )
+            add_phase("checkpoint_time", perf_counter() - checkpoint_started)
 
         if done:
-            metrics = env.sim.metrics(algo).to_dict()
+            metrics = env.episode_summary()
             row = train_metric_row(
                 step=step,
                 episode=episode_idx,
@@ -622,9 +1140,36 @@ def train_masked_dqn(
             row["replay_transitions"] = int(len(replay))
             row["training_simulated_seconds"] = float(training_simulated_seconds)
             if writer is not None:
+                logging_started = perf_counter()
                 write_train_scalars(writer, row, step)
+                add_phase("logging_time", perf_counter() - logging_started)
+            if timing_enabled:
+                episode_timing_rows.append({
+                    "episode": int(episode_idx), "episode_reward": float(episode_reward),
+                    "episode_transitions": int(episode_steps),
+                    "episode_simulation_time_s": float(env.sim.now),
+                    "episode_wall_time_s": float(perf_counter() - episode_wall_started),
+                    "transitions_per_second": float(episode_steps / max(1e-9, perf_counter() - episode_wall_started)),
+                    **{name: float(current_episode_timing[name]) for name in phase_names},
+                    "uav_planner_calls": int(current_planner["calls"]),
+                    "direct_path_calls": int(current_planner["direct"]),
+                    "local_detour_calls": int(current_planner["local_detour"]),
+                    "failed_path_calls": int(current_planner["failed"]),
+                    "uav_full_planning_time_s": float(current_planner["full_time_s"]),
+                    "uav_edge_construction_time_s": float(current_planner["edge_time_s"]),
+                    "uav_astar_search_time_s": float(current_planner["astar_time_s"]),
+                })
             episode_idx += 1
+            if max_episodes is not None and episode_idx >= int(max_episodes):
+                if max_episodes == 1:
+                    print("EPISODE_COMPLETED", flush=True)
+                break
+            current_episode_timing = {name: 0.0 for name in phase_names}
+            current_episode_calls = {name: 0 for name in phase_names}
+            current_planner = {"calls": 0, "direct": 0, "local_detour": 0, "failed": 0, "full_time_s": 0.0, "edge_time_s": 0.0, "astar_time_s": 0.0}
+            episode_wall_started = perf_counter()
             obs, mask = reset_env(env)
+            install_sim_timing_wrappers()
             episode_reward = 0.0
             episode_steps = 0
 
@@ -649,6 +1194,8 @@ def train_masked_dqn(
                 f"eval_reward={eval_mean.get('episode_reward', np.nan):.2f}"
             )
 
+    if max_episodes is not None and episode_idx >= int(max_episodes):
+        effective_timesteps = int(step)
     if episode_steps > 0:
         metrics = env.sim.metrics(algo).to_dict()
         row = train_metric_row(
@@ -673,6 +1220,7 @@ def train_masked_dqn(
         if writer is not None:
             write_train_scalars(writer, row, effective_timesteps)
 
+    wall_clock_time_s = perf_counter() - training_started_at
     save_outputs(
         out_dir=out_dir,
         run_dir=run_dir,
@@ -714,17 +1262,79 @@ def train_masked_dqn(
             "gamma_reference": float(hp.gamma),
             "discount_mode": str(smdp_cfg.get("discount_mode", "fixed_decision")),
         },
+        reward_metadata=current_reward_metadata,
+        resume_from=resolved_resume_from,
+        wall_clock_time_s=wall_clock_time_s,
     )
+    td_rows = []
+    for key, values in td_error_diagnostics.items():
+        rewards = np.asarray(values["rewards"], dtype=float)
+        errors = np.asarray(values["td_errors"], dtype=float)
+        priorities = np.asarray(values["priorities"], dtype=float)
+        gradient_norms = np.asarray(values["gradient_norms"], dtype=float)
+        td_rows.append(
+            {
+                "delta_t_bin": key,
+                "transition_count": int(values["transition_count"]),
+                "diagnostic_sample_count": int(errors.size),
+                "reward_mean": float(rewards.mean()) if rewards.size else np.nan,
+                "reward_std": float(rewards.std(ddof=0)) if rewards.size else np.nan,
+                "absolute_td_error_mean": float(errors.mean()) if errors.size else np.nan,
+                "absolute_td_error_median": float(np.median(errors)) if errors.size else np.nan,
+                "absolute_td_error_p95": float(np.percentile(errors, 95)) if errors.size else np.nan,
+                "sampled_priority_mean": float(priorities.mean()) if priorities.size else np.nan,
+                "gradient_norm_mean": float(gradient_norms.mean()) if gradient_norms.size else np.nan,
+            }
+        )
+    pd.DataFrame(td_rows).to_csv(run_dir / "td_error_by_delta_t.csv", index=False)
+    total_replay_events = max(1, sum(replay_event_counts.values()))
+    total_sampled_events = max(1, sum(sampled_event_counts.values()))
+    event_names = sorted(set(replay_event_counts) | set(sampled_event_counts))
     pd.DataFrame(
         [
             {
-                "delta_t_bin": key,
-                "mean_td_error": float(np.mean(values)) if values else np.nan,
-                "sample_count": len(values),
+                "event_type": event_type,
+                "replay_count": replay_event_counts[event_type],
+                "replay_ratio": replay_event_counts[event_type] / total_replay_events,
+                "sampled_count": sampled_event_counts[event_type],
+                "sampled_ratio": sampled_event_counts[event_type] / total_sampled_events,
             }
-            for key, values in td_error_diagnostics.items()
+            for event_type in event_names
         ]
-    ).to_csv(run_dir / "td_error_by_delta_t.csv", index=False)
+    ).to_csv(run_dir / "replay_event_composition.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "component": name,
+                "episode_training_sum": float(reward_component_sums[name]),
+                "transition_mean": float(reward_component_sums[name]) / max(1, reward_component_transitions),
+                "nonzero_ratio": float(reward_component_nonzero[name]) / max(1, reward_component_transitions),
+            }
+            for name in sorted(reward_component_sums)
+        ]
+    ).to_csv(run_dir / "reward_component_training_summary.csv", index=False)
+    diagnostics = {
+        "pearson_abs_td_error_delta_t": _safe_correlation(all_sampled_delta_t, all_sampled_td_error),
+        "spearman_abs_td_error_delta_t": _safe_correlation(
+            all_sampled_delta_t, all_sampled_td_error, ranked=True
+        ),
+        "nonfinite_loss_count": int(nonfinite_loss_count),
+        "nonfinite_gradient_count": int(nonfinite_gradient_count),
+        "maximum_gradient_norm": float(maximum_gradient_norm),
+        "mean_gradient_norm": float(np.mean(gradient_norm_history)) if gradient_norm_history else 0.0,
+        "p95_gradient_norm": float(np.percentile(gradient_norm_history, 95)) if gradient_norm_history else 0.0,
+        "p99_gradient_norm": float(np.percentile(gradient_norm_history, 99)) if gradient_norm_history else 0.0,
+        "gradient_updates": int(gradient_updates),
+        "training_simulated_seconds": float(training_simulated_seconds),
+        "wall_clock_time_s": float(wall_clock_time_s),
+        "simulated_seconds_per_wall_second": float(training_simulated_seconds / max(wall_clock_time_s, 1e-12)),
+        "reward_component_transitions": int(reward_component_transitions),
+        "diagnostic_sample_stride": int(hp.diagnostic_sample_stride),
+        "resume_from": resolved_resume_from,
+        "reward_metadata": current_reward_metadata,
+    }
+    with open(run_dir / "stage5_training_diagnostics.json", "w", encoding="utf-8") as f:
+        json.dump(diagnostics, f, indent=2)
     with open(run_dir / "replay_config.json", "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -735,10 +1345,324 @@ def train_masked_dqn(
                 "discount_mode": str(smdp_cfg.get("discount_mode", "fixed_decision")),
                 "gradient_updates": gradient_updates,
                 "training_simulated_seconds": training_simulated_seconds,
+                "wall_clock_time_s": wall_clock_time_s,
+                "reward_config_signature": current_reward_metadata["signature"],
+                "resume_from": resolved_resume_from,
             },
             f,
             indent=2,
         )
+    if reward_audit_out_dir is not None:
+        # The exporter reads the already-emitted transition ledger; it neither
+        # changes the reward returned by the environment nor updates the model.
+        from experiments.reward_audit import export_reward_audit
+
+        audit_summary = export_reward_audit(
+            out_dir=Path(reward_audit_out_dir),
+            env=env,
+            cfg=cfg,
+            hp=hp,
+            seed=base_seed,
+            episode_reward=episode_reward,
+            algo=algo,
+        )
+        print(
+            "Saved reward audit: "
+            f"{Path(reward_audit_out_dir)} (reward={audit_summary['episode_reward_from_transitions']:.6f})",
+            flush=True,
+        )
+    if timing_enabled:
+        timing_dir = Path(timing_out_dir or (run_dir / "timing"))
+        timing_dir.mkdir(parents=True, exist_ok=True)
+        # The context is shared by initial materialization and in-flight CAV
+        # recovery updates.  Export its request log separately so the two
+        # sources remain auditable even though their A* time is nested in the
+        # existing environment phases.
+        voxel_context = (
+            getattr(getattr(env.sim, "sortie_generator", None), "_voxel_context", None)
+            if env.sim is not None else None
+        )
+        voxel_execution_stats = (
+            voxel_context.snapshot_stats() if voxel_context is not None else {}
+        )
+        recovery_replanning_stats = (
+            {key: int(value) for key, value in getattr(env.sim.ground_controller, "replanning_stats", {}).items()}
+            if env.sim is not None and getattr(env.sim, "ground_controller", None) is not None else {}
+        )
+        mandatory_recovery_counters = (
+            "exact_replan_request_count", "exact_replan_success_count", "same_target_skip_count",
+            "path_suffix_reuse_count", "local_connection_success_count", "merged_request_count",
+            "exact_replan_limit_skip_count", "retained_old_plan_count",
+        )
+        for key in mandatory_recovery_counters:
+            recovery_replanning_stats.setdefault(key, 0)
+        for key in ("astar_request_count", "astar_actual_search_count", "astar_cache_hit_count", "astar_timeout_count", "astar_node_budget_exceeded_count"):
+            voxel_execution_stats.setdefault(key, 0)
+        request_rows = list(getattr(voxel_context, "request_log", []) or [])
+        pd.DataFrame(request_rows).to_csv(timing_dir / "voxel_astar_request_log.csv", index=False)
+        (timing_dir / "recovery_replanning_statistics.json").write_text(
+            json.dumps(
+                {
+                    "voxel_execution": voxel_execution_stats,
+                    "inflight_recovery_replanning": recovery_replanning_stats,
+                    "call_chain": [
+                        "ActiveCAVController.commit_cav_action",
+                        "ActiveCAVController._apply_recovery_update",
+                        "ActiveCAVController._plan_voxel_recovery_leg",
+                        "uav_path_planner.plan_selected_sortie_3d",
+                        "VoxelPlannerContext.segment",
+                        "build_and_benchmark_3d_voxel_astar.plan_3d_path",
+                    ],
+                }, ensure_ascii=False, indent=2
+            ), encoding="utf-8",
+        )
+        timing_frame = pd.DataFrame(episode_timing_rows)
+        timing_frame.to_csv(timing_dir / "training_10_episode_timing.csv", index=False)
+        measured_total = float(sum(phase_totals.values()))
+        process_rows = []
+        for name in phase_names:
+            process_rows.append({
+                "process_name": name, "total_time_s": float(phase_totals[name]),
+                "mean_time_per_call_ms": float(phase_totals[name] * 1000.0 / max(1, phase_calls[name])),
+                "call_count": int(phase_calls[name]),
+                "percentage_of_total_training_time": float(phase_totals[name] / max(wall_clock_time_s, 1e-12) * 100.0),
+            })
+        other = max(0.0, wall_clock_time_s - measured_total)
+        process_rows.append({
+            "process_name": "other_overhead_time", "total_time_s": other,
+            "mean_time_per_call_ms": other * 1000.0 / max(1, len(episode_timing_rows)),
+            "call_count": len(episode_timing_rows),
+            "percentage_of_total_training_time": other / max(wall_clock_time_s, 1e-12) * 100.0,
+        })
+        process_rows.append({
+            "process_name": "total_training_time", "total_time_s": wall_clock_time_s,
+            "mean_time_per_call_ms": wall_clock_time_s * 1000.0 / max(1, len(episode_timing_rows)),
+            "call_count": len(episode_timing_rows), "percentage_of_total_training_time": 100.0,
+        })
+        pd.DataFrame(process_rows).to_csv(timing_dir / "training_10_episode_process_summary.csv", index=False)
+        total_transitions = int(timing_frame["episode_transitions"].sum()) if not timing_frame.empty else 0
+        report = {
+            "config": str(cfg_path), "training_entry": "dynamic_patrol_marl.rl.train_masked_dqn",
+            "algorithm": algo, "planner": "A* visibility graph (Euclidean heuristic)",
+            "seed": int(base_seed), "episodes_completed": int(len(timing_frame)),
+            "max_episodes": int(max_episodes) if max_episodes is not None else None,
+            "total_training_time_s": wall_clock_time_s, "total_transitions": total_transitions,
+            "mean_transitions_per_episode": total_transitions / max(1, len(timing_frame)),
+            "transitions_per_second": total_transitions / max(wall_clock_time_s, 1e-12),
+            "transitions_per_minute": total_transitions / max(wall_clock_time_s, 1e-12) * 60.0,
+            "transitions_per_hour": total_transitions / max(wall_clock_time_s, 1e-12) * 3600.0,
+            "phase_totals_s": {**{k: float(v) for k, v in phase_totals.items()}, "other_overhead_time": other},
+            "uav_planner": {
+                "calls": int(sum(row["uav_planner_calls"] for row in episode_timing_rows)),
+                "direct_paths": int(sum(row["direct_path_calls"] for row in episode_timing_rows)),
+                "local_detours": int(sum(row["local_detour_calls"] for row in episode_timing_rows)),
+                "failed_paths": int(sum(row["failed_path_calls"] for row in episode_timing_rows)),
+                "full_planning_time_s": float(sum(row["uav_full_planning_time_s"] for row in episode_timing_rows)),
+                "edge_construction_time_s": float(sum(row["uav_edge_construction_time_s"] for row in episode_timing_rows)),
+                "astar_search_time_s": float(sum(row["uav_astar_search_time_s"] for row in episode_timing_rows)),
+            },
+        }
+        (timing_dir / "training_10_episode_timing_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        if max_episodes == 1 and not timing_frame.empty:
+            episode_row = timing_frame.iloc[0]
+            environment_initialization = float(phase_totals["environment_reset_time"])
+            candidate_generation = float(phase_totals["candidate_generation_time"])
+            observation_and_action_mask = float(
+                phase_totals["observation_building_time"]
+                + phase_totals["candidate_feature_time"]
+                + phase_totals["action_mask_time"]
+            )
+            policy_inference = float(phase_totals["policy_inference_time"])
+            selected_materialization = float(phase_totals["selected_sortie_materialization_time"])
+            voxel_astar_time = float(phase_totals["voxel_astar_search_time"])
+            reward_calculation = float(phase_totals["reward_calculation_time"])
+            replay_and_training = float(
+                phase_totals["replay_buffer_time"]
+                + phase_totals["network_training_time"]
+                + phase_totals["target_network_update_time"]
+            )
+            simulation_and_state_update = max(
+                0.0,
+                float(phase_totals["environment_step_time"])
+                - candidate_generation
+                - observation_and_action_mask
+                - selected_materialization
+                - reward_calculation,
+            )
+            episode_wall = float(wall_clock_time_s + environment_initialization)
+            top_level = {
+                "environment_initialization": environment_initialization,
+                "candidate_generation": candidate_generation,
+                "observation_and_action_mask": observation_and_action_mask,
+                "policy_inference": policy_inference,
+                "selected_sortie_materialization": selected_materialization,
+                "simulation_and_state_update": simulation_and_state_update,
+                "reward_calculation": reward_calculation,
+                "replay_buffer_and_training": replay_and_training,
+            }
+            other_overhead = max(0.0, episode_wall - sum(top_level.values()))
+            top_level["other_overhead"] = other_overhead
+            simple_rows = []
+            simple_call_counts = {
+                "environment_initialization": 1,
+                "candidate_generation": int(phase_calls["candidate_generation_time"]),
+                "observation_and_action_mask": int(
+                    phase_calls["observation_building_time"]
+                    + phase_calls["candidate_feature_time"]
+                    + phase_calls["action_mask_time"]
+                ),
+                "policy_inference": int(phase_calls["policy_inference_time"]),
+                "selected_sortie_materialization": int(phase_calls["selected_sortie_materialization_time"]),
+                "simulation_and_state_update": int(phase_calls["environment_step_time"]),
+                "reward_calculation": int(phase_calls["reward_calculation_time"]),
+                "replay_buffer_and_training": int(
+                    phase_calls["replay_buffer_time"]
+                    + phase_calls["network_training_time"]
+                    + phase_calls["target_network_update_time"]
+                ),
+                "other_overhead": 1,
+            }
+            for process_name, total_time in top_level.items():
+                calls = simple_call_counts[process_name]
+                simple_rows.append({
+                    "process_name": process_name,
+                    "call_count": calls,
+                    "total_time_s": total_time,
+                    "mean_time_ms": total_time * 1000.0 / max(1, calls),
+                    "percentage_of_episode_wall_time": total_time / max(episode_wall, 1e-12) * 100.0,
+                })
+            pd.DataFrame(simple_rows).to_csv(timing_dir / "one_episode_simple_timing.csv", index=False)
+            simple_summary = {
+                "episode_wall_time_s": episode_wall,
+                "episode_transitions": int(episode_row["episode_transitions"]),
+                "transitions_per_second": int(episode_row["episode_transitions"]) / max(episode_wall, 1e-12),
+                "episode_reward": float(episode_row["episode_reward"]),
+                "candidate_generation_calls": int(phase_calls["candidate_generation_time"]),
+                "selected_uav_plan_count": int(simple_counts["selected_uav_plan_count"]),
+                "safe_plan_count": int(simple_counts["safe_plan_count"]),
+                "voxel_astar_call_count": int(simple_counts["voxel_astar_call_count"]),
+                "voxel_astar_timeout_count": int(simple_counts["voxel_astar_timeout_count"]),
+                "materialization_failure_count": int(simple_counts["materialization_failure_count"]),
+                "network_update_count": int(gradient_updates),
+                "learning_starts": int(hp.learning_starts),
+                "voxel_astar_search_time_s": voxel_astar_time,
+                "selected_sortie_materialization_time_s": selected_materialization,
+                "voxel_execution": voxel_execution_stats,
+                "inflight_recovery_replanning": recovery_replanning_stats,
+                "processes": simple_rows,
+                "timing_note": "voxel_astar_search_time is nested in selected_sortie_materialization and is not added to top-level totals",
+            }
+            (timing_dir / "one_episode_simple_summary.json").write_text(
+                json.dumps(simple_summary, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            baseline = dict(cfg.get("recovery_replanning_optimization", {}).get("baseline", {}))
+            if baseline:
+                metric_row = next(
+                    (row for row in training_rows if not bool(row.get("partial_episode", False))),
+                    training_rows[0] if training_rows else {},
+                )
+                def metric_value(*names, default=0.0):
+                    for name in names:
+                        if name in metric_row and pd.notna(metric_row[name]):
+                            return float(metric_row[name])
+                    return float(default)
+                current = {
+                    "seed": int(base_seed), "task_count": metric_value("released_task_count", "total_tasks", default=0),
+                    "episode_total_time_s": episode_wall,
+                    "voxel_astar_call_count": int(voxel_execution_stats.get("astar_actual_search_count", 0)),
+                    "voxel_astar_total_time_s": voxel_astar_time,
+                    "simulation_and_state_update_time_s": simulation_and_state_update,
+                    "selected_sortie_materialization_time_s": selected_materialization,
+                    "completion_rate": metric_value("completion_rate_final", "completion_rate"),
+                    "episode_reward": float(episode_row["episode_reward"]),
+                    "illegal_actions": metric_value("illegal_actions", "illegal_action_count"),
+                    "commit_failures": metric_value("commit_failure_count", "commit_failures"),
+                }
+                (timing_dir / "recovery_replanning_comparison.json").write_text(
+                    json.dumps(
+                        {
+                            "baseline": baseline, "optimized": current,
+                            "delta_optimized_minus_baseline": {
+                                key: current[key] - float(value)
+                                for key, value in baseline.items() if key in current and isinstance(value, (int, float))
+                            },
+                        }, ensure_ascii=False, indent=2
+                    ), encoding="utf-8",
+                )
+            import matplotlib.pyplot as plt
+            figure_rows = sorted(simple_rows, key=lambda row: row["total_time_s"])
+            fig, ax = plt.subplots(figsize=(9, 5.5))
+            ax.barh(
+                [row["process_name"] for row in figure_rows],
+                [row["total_time_s"] for row in figure_rows],
+                color="#4472C4",
+            )
+            ax.set_xlabel("Wall time (s)")
+            ax.set_title("Stage 5 one-episode simple timing")
+            fig.tight_layout()
+            fig.savefig(timing_dir / "one_episode_simple_timing.png", dpi=180)
+            plt.close(fig)
+            ranked = sorted(top_level.items(), key=lambda item: item[1], reverse=True)
+            print("=" * 60, flush=True)
+            print("ONE EPISODE SIMPLE TIMING", flush=True)
+            print("=" * 60, flush=True)
+            print(f"Episode wall time: {episode_wall:.3f} s", flush=True)
+            print(f"Transitions: {int(episode_row['episode_transitions'])}", flush=True)
+            print(f"Transitions per second: {simple_summary['transitions_per_second']:.6f}", flush=True)
+            print(f"Episode reward: {float(episode_row['episode_reward']):.6f}", flush=True)
+            for name, value in top_level.items():
+                print(f"{name}: {value:.3f} s ({value / max(episode_wall, 1e-12) * 100.0:.2f}%)", flush=True)
+            print(f"  Voxel A* search: {voxel_astar_time:.6f} s", flush=True)
+            print(f"Candidate generation calls: {simple_summary['candidate_generation_calls']}", flush=True)
+            print(f"Selected UAV plans: {simple_summary['selected_uav_plan_count']}", flush=True)
+            print(f"Voxel A* calls: {simple_summary['voxel_astar_call_count']}", flush=True)
+            print(f"Voxel A* timeouts: {simple_summary['voxel_astar_timeout_count']}", flush=True)
+            print(f"Network updates: {gradient_updates}", flush=True)
+            print("Top 3 time-consuming modules:", flush=True)
+            for index, (name, value) in enumerate(ranked[:3], 1):
+                print(f"{index}. {name}: {value:.3f} s", flush=True)
+            print("=" * 60, flush=True)
+            print("RESULTS_SAVED", flush=True)
+    if max_episodes == 1 and timing_out_dir is not None:
+        diag_dir = Path(timing_out_dir)
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        attempts_df = pd.DataFrame(materialization_attempt_rows)
+        segments_df = pd.DataFrame(astar_segment_rows)
+        attempts_df.to_csv(diag_dir / "materialization_attempts.csv", index=False)
+        segments_df.to_csv(diag_dir / "astar_segment_calls.csv", index=False)
+        failure_summary = attempts_df[attempts_df.get("materialization_success", pd.Series(dtype=bool)) == False].groupby(["failure_stage", "failure_reason"], dropna=False).size().reset_index(name="count") if not attempts_df.empty else pd.DataFrame(columns=["failure_stage", "failure_reason", "count"])
+        failure_summary.to_csv(diag_dir / "materialization_failure_summary.csv", index=False)
+        status_summary = segments_df.groupby(["astar_status", "astar_success"], dropna=False).size().reset_index(name="count") if not segments_df.empty else pd.DataFrame(columns=["astar_status", "astar_success", "count"])
+        status_summary.to_csv(diag_dir / "astar_status_summary.csv", index=False)
+        stage_timing = pd.DataFrame([{"stage": "materialization_total", "total_time_s": float(attempts_df["elapsed_time_ms"].sum() / 1000.0) if not attempts_df.empty else 0.0}, {"stage": "astar_total", "total_time_s": float(segments_df["planning_time_ms"].sum() / 1000.0) if not segments_df.empty else 0.0}])
+        stage_timing.to_csv(diag_dir / "materialization_stage_timing.csv", index=False)
+        attempt_count = len(attempts_df); success_count = int(attempts_df["materialization_success"].sum()) if not attempts_df.empty else 0
+        seg_count = len(segments_df); seg_success = int(segments_df["astar_success"].sum()) if not segments_df.empty else 0
+        status_counts = Counter(segments_df["astar_status"].astype(str).tolist()) if not segments_df.empty else Counter()
+        diag_summary = {
+            "state_transition_count": int(episode_steps), "safe_plan_count": int(simple_counts["safe_plan_count"]),
+            "selected_uav_action_count": attempt_count, "materialization_attempt_count": attempt_count,
+            "materialization_success_count": success_count, "materialization_failure_count": attempt_count - success_count,
+            "committed_uav_sortie_count": success_count, "astar_path_request_count": seg_count,
+            "astar_actual_search_count": int(sum(not bool(x) for x in segments_df.get("cache_hit", pd.Series(dtype=bool)))) if not segments_df.empty else 0,
+            "astar_segment_success_count": seg_success, "astar_segment_failure_count": seg_count - seg_success,
+            "astar_timeout_count": int(status_counts.get("timeout", 0) + status_counts.get("sortie_timeout", 0)), "astar_no_path_count": int(status_counts.get("no_path", 0)),
+            "astar_invalid_start_count": int(status_counts.get("invalid_start", 0)), "astar_invalid_goal_count": int(status_counts.get("invalid_goal", 0)),
+            "astar_projection_failure_count": int(sum(status_counts.get(x, 0) for x in ("start_projection_failed", "goal_projection_failed"))),
+            "astar_internal_error_count": int(status_counts.get("internal_error", 0)), "astar_cache_hit_count": int(segments_df["cache_hit"].sum()) if not segments_df.empty else 0,
+            "failure_before_astar_count": int((attempts_df["failure_stage"] == "before_astar").sum()) if not attempts_df.empty else 0,
+            "failure_during_astar_count": int((attempts_df["failure_stage"] == "during_astar").sum()) if not attempts_df.empty else 0,
+            "failure_after_astar_count": int((attempts_df["failure_stage"] == "after_astar").sum()) if not attempts_df.empty else 0,
+            "mean_segments_per_materialization_attempt": seg_count / max(1, attempt_count), "mean_segments_per_successful_sortie": float(attempts_df.loc[attempts_df["materialization_success"], "segment_count_required"].mean()) if success_count else 0.0,
+            "mean_segments_per_failed_sortie": float(attempts_df.loc[~attempts_df["materialization_success"], "segment_count_required"].mean()) if attempt_count-success_count else 0.0,
+            "mean_successful_materialization_time_s": float(attempts_df.loc[attempts_df["materialization_success"], "elapsed_time_ms"].mean()/1000.0) if success_count else None,
+            "mean_failed_materialization_time_s": float(attempts_df.loc[~attempts_df["materialization_success"], "elapsed_time_ms"].mean()/1000.0) if attempt_count-success_count else None,
+            "total_astar_time_s": float(segments_df["planning_time_ms"].sum()/1000.0) if not segments_df.empty else 0.0,
+            "consistency_attempts": attempt_count == success_count + (attempt_count-success_count), "consistency_astar": seg_count == seg_success + (seg_count-seg_success),
+        }
+        (diag_dir / "materialization_diagnostics_summary.json").write_text(json.dumps(diag_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        failure_summary.to_csv(diag_dir / "materialization_failure_summary.csv", index=False)
+        print(f"MATERIALIZATION_DIAGNOSTICS_SAVED {diag_dir}", flush=True)
     if writer is not None:
         writer.flush()
         writer.close()
@@ -775,18 +1699,19 @@ def build_hyperparams(args: argparse.Namespace, cfg: Dict | None = None) -> DQNH
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/scenario_60node.yaml")
+    parser.add_argument("--config", default="configs/default_training.yaml")
     parser.add_argument("--algo", choices=ALGORITHMS, default=None, help="default: rl.algo from config, else dqn")
     parser.add_argument("--timesteps", type=int, default=None, help="override total training timesteps")
     parser.add_argument("--seed", type=int, default=None, help="base seed for fixed/curriculum sampling")
     parser.add_argument("--seed-mode", choices=SEED_MODES, default=None, help="default: training.seed_mode from config, else fixed")
     parser.add_argument("--stage-timesteps", default=None, help="comma-separated stage timesteps; one value or one per stage")
-    parser.add_argument("--out-dir", default=None, help="default: results/rl/dqn")
+    parser.add_argument("--out-dir", default=None, help="override project.results_dir from the config")
     parser.add_argument("--run-name", default=None, help="default: <algo>_seed<seed>; used for CSV and TensorBoard subdirs")
     parser.add_argument("--tensorboard-dir", default=None, help="default: results/rl/tensorboard/dqn")
     parser.add_argument("--disable-tensorboard", action="store_true", help="train without writing TensorBoard event files")
     parser.add_argument("--unmasked", action="store_true", help="train without using the action mask for selection or target Q values")
-    parser.add_argument("--model-name", default=None, help="output model filename under results/rl/dqn/<run-name>")
+    parser.add_argument("--model-name", default=None, help="override rl.model_name from the config")
+    parser.add_argument("--resume-from", default=None, help="Stage 5 checkpoint whose model and optimizer state are loaded")
     parser.add_argument("--params", default=None, help="optional DQN hyperparameter YAML file")
     parser.add_argument("--eval-seeds", default=None)
     parser.add_argument("--scenario", default=None, help="training scenario label passed to DynamicPatrolEnv")
@@ -810,6 +1735,11 @@ def main() -> None:
     parser.add_argument("--prioritized-replay-beta-final", type=float, default=None)
     parser.add_argument("--prioritized-replay-beta-steps", type=int, default=None)
     parser.add_argument("--priority-epsilon", type=float, default=None)
+    parser.add_argument("--checkpoint-interval", type=int, default=None)
+    parser.add_argument("--diagnostic-sample-stride", type=int, default=None)
+    parser.add_argument("--max-episodes", type=int, default=None, help="optional hard stop after complete episodes")
+    parser.add_argument("--timing-out-dir", default=None, help="write optional per-episode timing profile")
+    parser.add_argument("--reward-audit-out-dir", default=None, help="optional reward-ledger audit directory for the completed episode")
     args = parser.parse_args()
 
     root = project_root()
@@ -827,7 +1757,23 @@ def main() -> None:
     eval_scenario = args.eval_scenario or rl_cfg.get("eval_scenario", "eval")
     config_action_masking = bool(rl_cfg.get("action_masking", True))
     action_masking = False if args.unmasked else config_action_masking
-    out_dir, tensorboard_dir = resolve_dqn_output_dirs(root, args.out_dir, args.tensorboard_dir)
+    project_cfg = cfg.get("project", {})
+    configured_out_dir = args.out_dir if args.out_dir is not None else project_cfg.get("results_dir")
+    configured_tensorboard_dir = (
+        args.tensorboard_dir
+        if args.tensorboard_dir is not None
+        else project_cfg.get("tensorboard_dir")
+    )
+    out_dir, tensorboard_dir = resolve_dqn_output_dirs(
+        root,
+        configured_out_dir,
+        configured_tensorboard_dir,
+    )
+    reward_audit_out_dir = None
+    if args.reward_audit_out_dir is not None:
+        reward_audit_out_dir = Path(args.reward_audit_out_dir)
+        if not reward_audit_out_dir.is_absolute():
+            reward_audit_out_dir = root / reward_audit_out_dir
 
     model_path = train_masked_dqn(
         cfg=cfg,
@@ -848,6 +1794,10 @@ def main() -> None:
         seed_mode=args.seed_mode,
         stage_timesteps=parse_int_list(args.stage_timesteps),
         action_masking=action_masking,
+        resume_from=None if args.resume_from is None else Path(args.resume_from),
+        max_episodes=args.max_episodes,
+        timing_out_dir=None if args.timing_out_dir is None else Path(args.timing_out_dir),
+        reward_audit_out_dir=reward_audit_out_dir,
     )
     run_dir = model_path.parent
     run_name = run_dir.name

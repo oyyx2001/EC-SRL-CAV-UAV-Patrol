@@ -231,6 +231,8 @@ class JointPlanGenerator:
         }
         self.return_cfg = dict(simulator.cfg.get("uav_return_guard", {}))
         self.cost_cfg = dict(simulator.cfg.get("joint_plan_cost", {}))
+        self.candidate_cfg = dict(simulator.cfg.get("candidate_generation", {}))
+        self.candidate_optimization_enabled = bool(self.candidate_cfg.get("optimization_enabled", False))
         self.rejection_log: List[Dict[str, Any]] = []
         self.generation_log: List[Dict[str, Any]] = []
         self.commit_log: List[Dict[str, Any]] = []
@@ -301,6 +303,7 @@ class JointPlanGenerator:
             recovery_anchor_node=sim.recovery_queue_anchor_node(),
             vehicle_queue_time_s=sim.recovery_queue_travel_time_s(),
             allow_recovery_reschedule=sim.dynamic_insertion_enabled,
+            decision_epoch_id=context.get("decision_epoch_id"),
         )
 
     def _retarget_sortie(self, sortie: Sortie, ground: GroundCandidate) -> Sortie:
@@ -480,6 +483,60 @@ class JointPlanGenerator:
                 })
         return allowed
 
+    def _compatible_sorties(
+        self, ground: GroundCandidate, sorties: Sequence[Sortie], by_recovery: Dict[int, List[Sortie]]
+    ) -> List[Sortie]:
+        """Return only sorties whose existing rendezvous is compatible with CAV action.
+
+        The legacy path deliberately returns every sortie so baseline mode is
+        byte-for-byte compatible.  V1 skips the cartesian product for a CAV
+        move/reroute unless its target or planned route can serve the sortie's
+        already-selected recovery node.
+        """
+        if not self.candidate_optimization_enabled or ground.action_type in {"keep_route", "wait"}:
+            return list(sorties)
+        compatible_nodes = set(int(node) for node in (ground.planned_route or []))
+        if ground.target_node is not None:
+            compatible_nodes.add(int(ground.target_node))
+        selected: List[Sortie] = []
+        seen = set()
+        for node in sorted(compatible_nodes):
+            for sortie in by_recovery.get(int(node), []):
+                signature = (str(sortie.drone_id), tuple(int(task_id) for task_id in sortie.task_ids), int(sortie.recovery_node))
+                if signature not in seen:
+                    selected.append(sortie)
+                    seen.add(signature)
+        return selected
+
+    @staticmethod
+    def _joint_signature(ground: GroundCandidate, sortie: Optional[Sortie]) -> Tuple[Any, ...]:
+        return (
+            str(ground.action_type), None if ground.target_node is None else int(ground.target_node),
+            None if sortie is None else str(sortie.drone_id),
+            tuple() if sortie is None else tuple(int(task_id) for task_id in sortie.task_ids),
+            None if sortie is None else int(sortie.recovery_node),
+        )
+
+    def _bounded_append_plan(self, pool: List[JointPlan], plan: JointPlan, plan_type: str) -> None:
+        if not self.candidate_optimization_enabled:
+            pool.append(plan)
+            return
+        capacity = max(0, int(self.quotas[plan_type]))
+        if capacity <= 0:
+            return
+        rank = lambda item: (
+            round(float(item.pre_score), 12), item.uav_id or "", tuple(item.task_ids),
+            item.cav_target_node if item.cav_target_node is not None else -1,
+            item.insertion_index if item.insertion_index is not None else -1,
+        )
+        if len(pool) < capacity:
+            pool.append(plan)
+            return
+        worst = max(pool, key=rank)
+        if rank(plan) < rank(worst):
+            pool.remove(worst)
+            pool.append(plan)
+
     def generate_joint_plans(self, observation_context: Optional[Dict[str, Any]] = None) -> JointPlanCache:
         context = dict(observation_context or {})
         started = perf_counter()
@@ -489,15 +546,37 @@ class JointPlanGenerator:
         sorties = self._sorties(context)
         references = self._reference_distances(sorties, keep)
         pools = {PLAN_TYPE_I: [], PLAN_TYPE_II: [], PLAN_TYPE_III: []}
+        sorties_by_recovery: Dict[int, List[Sortie]] = {}
+        for sortie in sorties:
+            sorties_by_recovery.setdefault(int(sortie.recovery_node), []).append(sortie)
+        seen_joint_signatures: set[Tuple[Any, ...]] = set()
+        raw_joint_plan_count = 0
+        duplicate_joint_plan_count = 0
         serial = 1
         for ground in grounds:
             if ground.action_type != "keep_route":
                 ptype = PLAN_TYPE_III if ground.action_type == "reroute" else PLAN_TYPE_II
-                pools[ptype].append(self._make_plan(ground, None, None, ptype, fingerprint, context, serial))
+                raw_joint_plan_count += 1
+                signature = self._joint_signature(ground, None)
+                if self.candidate_optimization_enabled and signature in seen_joint_signatures:
+                    duplicate_joint_plan_count += 1
+                else:
+                    seen_joint_signatures.add(signature)
+                    self._bounded_append_plan(
+                        pools[ptype], self._make_plan(ground, None, None, ptype, fingerprint, context, serial), ptype
+                    )
                 serial += 1
             override = self._ground_override(ground)
-            for base_sortie in sorties[: self.max_sorties_per_ground]:
-                sortie = self._retarget_sortie(base_sortie, ground)
+            compatible = self._compatible_sorties(ground, sorties, sorties_by_recovery)
+            for base_sortie in compatible[: self.max_sorties_per_ground]:
+                # A compatible target is already the sortie recovery node (or
+                # lies on the candidate CAV route), so V1 need not create an
+                # unrelated retargeted Cartesian-product variant.
+                sortie = (
+                    deepcopy(base_sortie)
+                    if self.candidate_optimization_enabled
+                    else self._retarget_sortie(base_sortie, ground)
+                )
                 if not sortie.feasible:
                     continue
                 ranked = self.sim.recovery_scheduler.evaluate_insertions(
@@ -507,10 +586,16 @@ class JointPlanGenerator:
                     ptype = PLAN_TYPE_I if ground.action_type == "keep_route" else (
                         PLAN_TYPE_III if ground.action_type == "reroute" else PLAN_TYPE_II
                     )
+                    raw_joint_plan_count += 1
+                    signature = self._joint_signature(ground, sortie)
+                    if self.candidate_optimization_enabled and signature in seen_joint_signatures:
+                        duplicate_joint_plan_count += 1
+                        continue
+                    seen_joint_signatures.add(signature)
                     plan = self._make_plan(ground, sortie, evaluation, ptype, fingerprint, context, serial)
                     serial += 1
                     if self._guard_allows(plan, references):
-                        pools[ptype].append(plan)
+                        self._bounded_append_plan(pools[ptype], plan, ptype)
         for group in pools.values():
             group.sort(key=lambda p: (round(float(p.pre_score), 12), p.uav_id or "", tuple(p.task_ids), p.cav_target_node or -1, p.insertion_index or -1))
         retained: List[JointPlan] = []
@@ -548,8 +633,24 @@ class JointPlanGenerator:
             "retained_plans": int(mask.sum()), "padding_slots": int((~mask).sum()),
             "type_I_generated": len(pools[PLAN_TYPE_I]), "type_II_generated": len(pools[PLAN_TYPE_II]),
             "type_III_generated": len(pools[PLAN_TYPE_III]), "generation_time_ms": elapsed,
+            "raw_joint_plan_count": int(raw_joint_plan_count),
+            "duplicate_joint_plan_count": int(duplicate_joint_plan_count),
+            "deduplicated_joint_plan_count": int(raw_joint_plan_count - duplicate_joint_plan_count),
+            "retained_joint_plan_count": len(retained),
         })
         epoch = int(context.get("decision_epoch_id", 0))
+        # Sortie generation is recorded per UAV.  Attach joint-level totals to
+        # each matching call row so a single CSV is sufficient for profiling.
+        for row in reversed(self.sim.sortie_generator.candidate_generation_log):
+            if int(row.get("decision_epoch_id", -1)) != epoch or abs(float(row.get("simulation_time", -math.inf)) - float(self.sim.now)) > 1e-9:
+                continue
+            row.update({
+                "raw_joint_plan_count": int(raw_joint_plan_count),
+                "duplicate_joint_plan_count": int(duplicate_joint_plan_count),
+                "deduplicated_joint_plan_count": int(raw_joint_plan_count - duplicate_joint_plan_count),
+                "retained_joint_plan_count": len(retained),
+                "joint_plan_generation_time_ms": float(elapsed),
+            })
         for index, plan in enumerate(slots):
             self.slot_log.append(
                 {
@@ -647,7 +748,12 @@ class JointPlanGenerator:
         for key, value in snapshot["controller"].items():
             setattr(sim.ground_controller, key, value)
 
-    def commit_joint_plan(self, cache: JointPlanCache, action: int) -> Tuple[bool, Optional[JointPlan]]:
+    def commit_joint_plan(
+        self,
+        cache: JointPlanCache,
+        action: int,
+        _path_attempted_slots: Optional[set[int]] = None,
+    ) -> Tuple[bool, Optional[JointPlan]]:
         if not self.validate_cache(cache) or action < 0 or action >= self.action_slots or not bool(cache.action_mask[action]):
             self.commit_failures += 1
             return False, None
@@ -666,7 +772,10 @@ class JointPlanGenerator:
                 raise RuntimeError("injected_joint_commit_failure")
             if plan.is_safe:
                 self.selected_type_counts[PLAN_SAFE] += 1
-                self.commit_log.append({"time": self.sim.now, "plan_id": plan.plan_id, "success": True, "plan_type": plan.plan_type})
+                self.commit_log.append({
+                    "time": self.sim.now, "plan_id": plan.plan_id, "success": True,
+                    "plan_type": plan.plan_type, "ground_action": "keep_route",
+                })
                 return True, plan
             if not plan.ground_already_committed and not self.sim.ground_controller.commit_cav_action(plan.ground_candidate, validate_fingerprint=True):
                 raise RuntimeError("ground_commit_failed")
@@ -681,7 +790,26 @@ class JointPlanGenerator:
                     raise RuntimeError("uav_launch_state_changed")
                 if any(self.sim.task_pool.by_id[tid].status != "unassigned" for tid in sortie.task_ids):
                     raise RuntimeError("task_state_changed")
-                evaluation = plan.insertion_evaluation or {}
+                # Candidate generation is deliberately estimate-only.  The
+                # obstacle-aware path is materialized here, after the policy
+                # has selected one JointPlan, then recovery feasibility is
+                # recomputed from the actual segments before any state changes.
+                if bool(self.sim.cfg.get("uav_path_planning", {}).get("enabled", False)):
+                    realized = self.sim.sortie_generator.materialize_selected_sortie(
+                        sortie, drone, self.sim.now, self.sim.task_pool.by_id
+                    )
+                    if realized is None:
+                        raise RuntimeError("selected_sortie_real_path_infeasible")
+                    sortie = realized
+                    materialization = dict(getattr(self.sim.sortie_generator, "last_materialization", {}))
+                    self.commit_log.append({"time": self.sim.now, "plan_id": plan.plan_id,
+                                            "selected_action_slot": int(action), "sortie_id": self.sim.recovery_scheduler.sortie_id(sortie),
+                                            **materialization})
+                    evaluation = self.sim.evaluate_insertion(sortie, commit=False)
+                    if not bool(evaluation.get("feasible", False)):
+                        raise RuntimeError("selected_sortie_post_plan_revalidation_failed")
+                else:
+                    evaluation = plan.insertion_evaluation or {}
                 entry = dict(evaluation["entry"])
                 index = int(plan.insertion_index)
                 if index < 0 or index > len(self.sim.recovery_queue):
@@ -702,6 +830,7 @@ class JointPlanGenerator:
                 self.sim._record_insertion_attempt(sortie, evaluation)
                 self.sim.task_pool.mark_assigned(sortie.task_ids, drone.id, self.sim.now)
                 drone.assign_sortie(sortie, self.sim.now)
+                plan.sortie = sortie
                 self.sim.sortie_log.append({"time": self.sim.now, **sortie.to_dict()})
                 self.sim.event_log.append({"time": self.sim.now, "event": "launch", "agent": drone.id, "node": sortie.launch_node, "tasks": ";".join(map(str, sortie.task_ids))})
                 self.sim.event_log.append({"time": self.sim.now, "event": "recovery_queue_insert", "agent": drone.id, "node": int(sortie.recovery_node), "queue_position": index, "tasks": ";".join(map(str, sortie.task_ids))})
@@ -712,13 +841,70 @@ class JointPlanGenerator:
                 self.selected_ground_only += 1
             elif plan.ground_candidate.action_type != "keep_route":
                 self.selected_joint_launch_ground += 1
-            self.commit_log.append({"time": self.sim.now, "plan_id": plan.plan_id, "success": True, "plan_type": plan.plan_type})
+            self.commit_log.append({
+                "time": self.sim.now, "plan_id": plan.plan_id, "success": True,
+                "plan_type": plan.plan_type, "ground_action": plan.ground_candidate.action_type,
+            })
             return True, plan
         except Exception as exc:
             self._restore(snapshot)
+            # A real selected-path failure is not an illegal state transition.
+            # The safe JointPlan remains legal and prevents an empty action
+            # mask while a later decision can try a different candidate.
+            if str(exc) in {
+                "selected_sortie_real_path_infeasible",
+                "selected_sortie_post_plan_revalidation_failed",
+            }:
+                attempted = set(_path_attempted_slots or set())
+                attempted.add(int(plan.slot_index))
+                if bool(self.sim.cfg.get("uav_path_planning", {}).get("fallback_to_next_candidate", False)):
+                    alternatives = sorted(
+                        (
+                            item for item in cache.plan_slots
+                            if item is not None
+                            and not item.is_safe
+                            and bool(item.mask)
+                            and bool(item.feasible)
+                            and int(item.slot_index) not in attempted
+                        ),
+                        key=lambda item: int(item.slot_index),
+                    )
+                    for alternative in alternatives:
+                        self.commit_log.append({
+                            "time": self.sim.now,
+                            "plan_id": plan.plan_id,
+                            "success": False,
+                            "plan_type": plan.plan_type,
+                            "ground_action": plan.ground_candidate.action_type,
+                            "fallback_attempt_slot": int(alternative.slot_index),
+                            "fallback_reason": str(exc),
+                        })
+                        committed, fallback_plan = self.commit_joint_plan(
+                            cache,
+                            int(alternative.slot_index),
+                            _path_attempted_slots=attempted,
+                        )
+                        if committed:
+                            return True, fallback_plan
+                safe = next((item for item in cache.plan_slots if item is not None and item.is_safe), None)
+                if safe is not None:
+                    self.selected_type_counts[PLAN_SAFE] += 1
+                    self.commit_log.append({
+                        "time": self.sim.now,
+                        "plan_id": plan.plan_id,
+                        "success": True,
+                        "plan_type": PLAN_SAFE,
+                        "ground_action": "keep_route",
+                        "fallback_reason": str(exc),
+                    })
+                    return True, safe
             self.commit_failures += 1
             self.rollback_count += 1
-            self.commit_log.append({"time": self.sim.now, "plan_id": plan.plan_id, "success": False, "reason": str(exc), "plan_type": plan.plan_type})
+            self.commit_log.append({
+                "time": self.sim.now, "plan_id": plan.plan_id, "success": False,
+                "reason": str(exc), "plan_type": plan.plan_type,
+                "ground_action": plan.ground_candidate.action_type,
+            })
             return False, plan
 
     def select_heuristic(self, cache: JointPlanCache) -> int:
@@ -739,6 +925,12 @@ class JointPlanGenerator:
             PLAN_TYPE_III: sum(row.get("type_III_generated", 0) for row in self.generation_log),
         }
         total_generated_typed = max(1, sum(generated_by_type.values()))
+        successful_commits = [row for row in self.commit_log if bool(row.get("success"))]
+        ground_action_counts = {
+            action: sum(row.get("ground_action") == action for row in successful_commits)
+            for action in ("keep_route", "wait", "move_to", "reroute")
+        }
+        ground_action_total = max(1, len(successful_commits))
         return {
             "mean_generated_plans": float(np.mean([row["generated_plans"] for row in self.generation_log])) if self.generation_log else 0.0,
             "mean_valid_plans": float(np.mean([row["retained_plans"] for row in self.generation_log])) if self.generation_log else 0.0,
@@ -755,6 +947,10 @@ class JointPlanGenerator:
             "type_I_selected_rate": self.selected_type_counts[PLAN_TYPE_I] / selections,
             "type_II_selected_rate": self.selected_type_counts[PLAN_TYPE_II] / selections,
             "type_III_selected_rate": self.selected_type_counts[PLAN_TYPE_III] / selections,
+            "joint_keep_route_rate": ground_action_counts["keep_route"] / ground_action_total,
+            "joint_wait_rate": ground_action_counts["wait"] / ground_action_total,
+            "joint_move_to_rate": ground_action_counts["move_to"] / ground_action_total,
+            "joint_reroute_rate": ground_action_counts["reroute"] / ground_action_total,
             "return_guard_rejection_rate": self.return_guard_rejections / max(1, self.return_guard_evaluations),
             "commit_failure_count": self.commit_failures, "rollback_count": self.rollback_count,
             "atomic_commit_failure_rate": self.commit_failures / max(1, len(self.commit_log)),

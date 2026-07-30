@@ -83,8 +83,13 @@ class NStepSMDPAccumulator:
             total_delta_t += float(item.delta_t)
             discount_product *= float(item.bootstrap_discount)
             terminal_index = index
-            if item.done:
+            # A time-limit truncation ends the sampled sequence and flushes
+            # the accumulator, but it is not an MDP terminal state.  Preserve
+            # its bootstrap factor; Rainbow will mask only ``terminated``.
+            if item.terminated:
                 discount_product = 0.0
+                break
+            if item.truncated:
                 break
         last = items[terminal_index]
         return NStepTransition(
@@ -194,3 +199,19 @@ def td_error_delta_t_bin(delta_t: float) -> str:
     if value <= 120.0:
         return "delta_60_120"
     return "delta_over_120"
+
+
+def stage5_td_error_delta_t_bin(delta_t: float) -> str:
+    """Return the Stage 5 diagnostic bin without changing legacy reports."""
+    value = float(delta_t)
+    if abs(value) <= 1e-12:
+        return "dt_eq_0"
+    if value <= 10.0:
+        return "dt_0_10"
+    if value <= 30.0:
+        return "dt_10_30"
+    if value <= 60.0:
+        return "dt_30_60"
+    if value <= 120.0:
+        return "dt_60_120"
+    return "dt_over_120"

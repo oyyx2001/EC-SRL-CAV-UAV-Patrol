@@ -1,6 +1,0 @@
-base: scenario_60node_stage4_joint_common.yaml
-cav_control:
-  mode: joint_plan
-  action_set: [keep_route]
-joint_plan:
-  type_quotas: {type_I: 24, type_II: 0, type_III: 0}

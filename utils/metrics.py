@@ -80,6 +80,10 @@ class EpisodeMetrics:
     type_I_selected_rate: float = 0.0
     type_II_selected_rate: float = 0.0
     type_III_selected_rate: float = 0.0
+    joint_keep_route_rate: float = 0.0
+    joint_wait_rate: float = 0.0
+    joint_move_to_rate: float = 0.0
+    joint_reroute_rate: float = 0.0
     return_guard_rejection_rate: float = 0.0
     commit_failure_count: int = 0
     rollback_count: int = 0

@@ -37,6 +37,7 @@ class Vehicle:
 
     wait_time: float = 0.0
     distance_time: float = 0.0
+    distance_traveled_m: float = 0.0
     last_arrival_time: Optional[float] = None
     schedule_version: int = 0
     wait_until: Optional[float] = None
@@ -235,9 +236,12 @@ class Vehicle:
             if self.edge_remaining_time <= 1e-9:
                 self.edge_remaining_time = float(network.G[u][v]["vehicle_time_s"])
 
+            edge_time = float(network.G[u][v]["vehicle_time_s"])
             move = min(remaining_dt, self.edge_remaining_time)
             if move > 1e-9:
                 self.at_intersection = False
+                if edge_time > 1e-9:
+                    self.distance_traveled_m += float(network.arc_length((u, v))) * (float(move) / edge_time)
             self.edge_remaining_time -= move
             self.remaining_time = max(0.0, self.remaining_time - move)
             self.distance_time += move

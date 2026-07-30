@@ -9,6 +9,7 @@ import json
 import pickle
 import numpy as np
 import networkx as nx
+from shapely import wkt
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,10 @@ class RoadNetwork:
         self.vehicle_time: Dict[int, Dict[int, float]] = {}
         self.vehicle_paths: Dict[int, Dict[int, List[int]]] = {}
         self.drone_time_matrix: Dict[int, Dict[int, float]] = {}
+        self.external_to_internal: Dict[str, int] = {}
+        self.internal_to_external: Dict[int, str] = {}
+        self.source_graph_type: Optional[str] = None
+        self.source_edge_count: Optional[int] = None
         self._build()
         self._resolve_patrol_center()
         self._compute_shortest_paths()
@@ -51,16 +56,74 @@ class RoadNetwork:
     def _build(self) -> None:
         net_cfg = self.cfg["network"]
         kind = net_cfg.get("type", "synthetic_grid")
-        if kind not in {"synthetic_grid", "irregular_city", "imported_osm"}:
-            raise ValueError(f"Supported network types: synthetic_grid, irregular_city, imported_osm; got {kind}")
+        if kind not in {"synthetic_grid", "irregular_city", "imported_osm", "xinjiekou_graphml"}:
+            raise ValueError(f"Supported network types: synthetic_grid, irregular_city, imported_osm, xinjiekou_graphml; got {kind}")
         rng = np.random.default_rng(int(self.cfg["project"].get("seed", 42)) + int(net_cfg.get("risk_seed_shift", 100)))
-        if kind == "irregular_city":
+        if kind == "xinjiekou_graphml":
+            self._build_xinjiekou_graphml(net_cfg)
+        elif kind == "irregular_city":
             self._build_irregular_city(net_cfg, rng)
         elif kind == "imported_osm":
             self._build_imported_osm(net_cfg, rng)
         else:
             self._build_jittered_grid(net_cfg, rng)
         self._assign_risk(rng)
+
+    def _build_xinjiekou_graphml(self, net_cfg: Dict) -> None:
+        """Load packaged Xinjiekou roads into the integer-only simulation space."""
+        graphml = self._resolve_import_path(net_cfg["graphml_file"])
+        source = nx.read_graphml(graphml, force_multigraph=True)
+        self.source_graph_type = type(source).__name__
+        self.source_edge_count = int(source.number_of_edges())
+        expected = int(net_cfg.get("expected_node_count", 333))
+        if source.number_of_nodes() != expected or source.number_of_edges() != int(net_cfg.get("expected_edge_count", 601)):
+            raise ValueError(f"Unexpected Xinjiekou graph size: {source.number_of_nodes()} nodes, {source.number_of_edges()} edges")
+        external_ids = sorted(str(node) for node in source.nodes)
+        self.external_to_internal = {node: index for index, node in enumerate(external_ids)}
+        self.internal_to_external = {index: node for node, index in self.external_to_internal.items()}
+        for external, internal in self.external_to_internal.items():
+            data = source.nodes[external]
+            if "x" not in data or "y" not in data:
+                geometry = data.get("geometry")
+                point = wkt.loads(geometry) if isinstance(geometry, str) else geometry
+                if point is None or not hasattr(point, "x"):
+                    raise ValueError(f"Missing Xinjiekou coordinates for {external}")
+                data = dict(data, x=float(point.x), y=float(point.y))
+            x, y = float(data["x"]), float(data["y"])
+            if not math.isfinite(x) or not math.isfinite(y):
+                raise ValueError(f"Invalid Xinjiekou coordinates for {external}")
+            self.G.add_node(internal, x=x, y=y, external_id=external)
+        directed = source.is_directed()
+        edges = source.edges(keys=True, data=True) if source.is_multigraph() else ((u, v, 0, d) for u, v, d in source.edges(data=True))
+        for u, v, _key, data in edges:
+            iu, iv = self.external_to_internal[str(u)], self.external_to_internal[str(v)]
+            length = float(data.get("length_m", data.get("network_distance_m", self._distance(iu, iv))))
+            travel = float(data.get("travel_time_s", data.get("estimated_travel_time_s", length / max(float(net_cfg.get("vehicle_speed_mps", 8.3)), 1e-9))))
+            attrs = dict(data, length_m=length, vehicle_time_s=travel, vehicle_speed_mps=length / max(travel, 1e-9), source="xinjiekou_graphml")
+            self._add_best_graphml_arc(iu, iv, attrs)
+            if not directed:
+                # Source is an undirected MultiGraph: each physical road is usable
+                # both ways, never converted into a fabricated one-way relation.
+                self._add_best_graphml_arc(iv, iu, attrs)
+
+    def _add_best_graphml_arc(self, u: int, v: int, attrs: Dict) -> None:
+        if self.G.has_edge(u, v) and float(self.G[u][v]["vehicle_time_s"]) <= float(attrs["vehicle_time_s"]):
+            return
+        self.G.add_edge(u, v, **attrs)
+
+    def to_internal_node(self, node: int | str) -> int:
+        if isinstance(node, str) and node in self.external_to_internal:
+            return self.external_to_internal[node]
+        value = int(node)
+        if value not in self.G:
+            raise KeyError(f"Unknown node: {node}")
+        return value
+
+    def to_external_node(self, node: int | str) -> str:
+        return self.internal_to_external.get(self.to_internal_node(node), str(self.to_internal_node(node)))
+
+    def get_node_xy(self, node: int | str) -> Tuple[float, float]:
+        return self.node_xy(self.to_internal_node(node))
 
     def _resolve_import_path(self, raw_path: str | Path) -> Path:
         path = Path(raw_path)
@@ -368,7 +431,7 @@ class RoadNetwork:
             cy = (min(ys) + max(ys)) / 2.0
             self.patrol_center = int(min(self.G.nodes, key=lambda n: math.hypot(self.G.nodes[n]["x"] - cx, self.G.nodes[n]["y"] - cy)))
             return
-        center = int(raw)
+        center = self.to_internal_node(raw)
         if center not in self.G:
             raise ValueError(f"Configured patrol_center is not in the network: {center}")
         self.patrol_center = center
@@ -425,21 +488,21 @@ class RoadNetwork:
             for j in self.nodes:
                 self.drone_time_matrix[i][j] = 0.0 if i == j else self.euclidean_distance(i, j) / speed
 
-    def node_xy(self, node: int) -> Tuple[float, float]:
-        data = self.G.nodes[int(node)]
+    def node_xy(self, node: int | str) -> Tuple[float, float]:
+        data = self.G.nodes[self.to_internal_node(node)]
         return float(data["x"]), float(data["y"])
 
     def euclidean_distance(self, i: int, j: int) -> float:
-        return self._distance(int(i), int(j))
+        return self._distance(self.to_internal_node(i), self.to_internal_node(j))
 
     def get_vehicle_time(self, i: int, j: int) -> float:
-        return float(self.vehicle_time.get(int(i), {}).get(int(j), math.inf))
+        return float(self.vehicle_time.get(self.to_internal_node(i), {}).get(self.to_internal_node(j), math.inf))
 
     def get_vehicle_path(self, i: int, j: int) -> List[int]:
-        return list(self.vehicle_paths.get(int(i), {}).get(int(j), []))
+        return list(self.vehicle_paths.get(self.to_internal_node(i), {}).get(self.to_internal_node(j), []))
 
     def get_drone_time(self, i: int, j: int) -> float:
-        return float(self.drone_time_matrix[int(i)][int(j)])
+        return float(self.drone_time_matrix[self.to_internal_node(i)][self.to_internal_node(j)])
 
     def arc_length(self, arc: Tuple[int, int]) -> float:
         u, v = arc

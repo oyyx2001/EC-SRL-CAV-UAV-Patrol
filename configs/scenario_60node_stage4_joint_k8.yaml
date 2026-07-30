@@ -1,4 +1,0 @@
-base: scenario_60node_stage4_joint_full.yaml
-joint_plan:
-  max_non_safe_plans: 8
-  type_quotas: {type_I: 4, type_II: 3, type_III: 1}

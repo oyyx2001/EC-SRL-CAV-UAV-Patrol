@@ -1,0 +1,33 @@
+{
+  "scene": "xinjiekou",
+  "crs": "EPSG:32650",
+  "grid_size_m": 10.0,
+  "rows": 260,
+  "cols": 260,
+  "bounds": {
+    "min_x": 667112.5337577724,
+    "min_y": 3546702.052623,
+    "max_x": 669712.5337577724,
+    "max_y": 3549302.052623
+  },
+  "map_padding_m": 50.0,
+  "all_touched": true,
+  "horizontal_safety_buffer_m": 0.0,
+  "vertical_safety_margin_m": 0.0,
+  "layers_m": [
+    20,
+    40,
+    60,
+    80,
+    100,
+    120
+  ],
+  "transform": [
+    10.0,
+    0.0,
+    667112.5337577724,
+    0.0,
+    -10.0,
+    3549302.052623
+  ]
+}

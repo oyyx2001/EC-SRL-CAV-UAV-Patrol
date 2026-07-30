@@ -6,6 +6,7 @@ import json
 import math
 from time import perf_counter
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from collections import Counter
 
 
 GROUND_ACTIONS = ("keep_route", "wait", "move_to", "reroute")
@@ -93,6 +94,13 @@ class ActiveCAVController:
         self.pending_realized_gain: Dict[str, Dict[str, float]] = {}
         self.realized_gains: List[float] = []
         self._candidate_serial = 0
+        # These counters are intentionally controller-owned: they distinguish
+        # state-advance recovery work from initial selected-sortie planning.
+        self.replanning_stats: Counter = Counter()
+        self._replan_epoch_time: Optional[float] = None
+        self._replans_by_drone: Counter = Counter()
+        self._replans_in_epoch = 0
+        self._last_recovery_plan_failure_reason: Optional[str] = None
 
     @property
     def active(self) -> bool:
@@ -391,6 +399,140 @@ class ActiveCAVController:
                 candidates.append(self.evaluate_cav_candidate(reroute, keep_reference=keep))
         return candidates
 
+    def _uses_voxel_recovery_planner(self) -> bool:
+        planning = self.sim.cfg.get("uav_path_planning", {})
+        return bool(planning.get("enabled", False)) and (
+            str(planning.get("planner_type", "")).lower() == "voxel_astar_3d"
+        )
+
+    def _voxel_context(self):
+        """Return the single per-episode voxel context shared with sorties."""
+        if not self._uses_voxel_recovery_planner():
+            return None
+        planning = self.sim.cfg.get("uav_path_planning", {})
+        generator = self.sim.sortie_generator
+        if generator is None:
+            return None
+        try:
+            import sys
+            from pathlib import Path
+
+            module_root = str(Path(__file__).resolve().parents[1] / "truck_uav_modules")
+            if module_root not in sys.path:
+                sys.path.insert(0, module_root)
+            from uav_path_planner import VoxelPlannerContext
+
+            region = planning.get("region", self.sim.cfg.get("network", {}).get("uav_path_region"))
+            if not region:
+                return None
+            if generator._voxel_context is None:
+                generator._voxel_context = VoxelPlannerContext(str(region), planning)
+            return generator._voxel_context
+        except Exception:
+            return None
+
+    def _replan_limits(self) -> Tuple[int, int]:
+        cfg=self.sim.cfg.get("uav_path_planning", {}).get("recovery_replanning", {})
+        return max(1, int(cfg.get("max_exact_replans_per_uav_per_decision", 1))), max(1, int(cfg.get("max_exact_replans_system_per_decision", 4)))
+
+    def _reserve_exact_replan(self, drone_id: str) -> bool:
+        now=float(self.sim.now)
+        if self._replan_epoch_time is None or abs(self._replan_epoch_time-now) > 1e-9:
+            self._replan_epoch_time=now
+            self._replans_by_drone.clear()
+            self._replans_in_epoch=0
+        per_uav, system=self._replan_limits()
+        if self._replans_by_drone[str(drone_id)] >= per_uav or self._replans_in_epoch >= system:
+            self.replanning_stats["exact_replan_limit_skip_count"] += 1
+            return False
+        self._replans_by_drone[str(drone_id)] += 1
+        self._replans_in_epoch += 1
+        self.replanning_stats["exact_replan_request_count"] += 1
+        return True
+
+    def _flight_state(self) -> Dict[str, float]:
+        generator=self.sim.sortie_generator
+        params=generator._flight_parameters()
+        return {
+            "cruise_speed": float(params["cruise_speed"]), "climb_speed": float(params["up_speed"]),
+            "descent_speed": float(params["down_speed"]), "cruise_power": float(params["cruise_power"]),
+            "climb_power": float(params["up_power"]), "descent_power": float(params["down_power"]),
+        }
+
+    def _recovery_voxel(self, context: Any, node: int) -> Tuple[int, int, int]:
+        planning=self.sim.cfg.get("uav_path_planning", {})
+        altitude=float(planning.get("default_task_observation_altitude_m", 20.0))
+        xy=self.sim.network.node_xy(int(node))
+        return tuple(context.free_near(context.point((xy[0], xy[1], altitude))))
+
+    def _voxel_leg_from_path(self, context: Any, path: Sequence[Tuple[int, int, int]]) -> Optional[Dict[str, Any]]:
+        try:
+            metrics=context.path_metrics(list(path), self._flight_state())
+        except (TypeError, ValueError):
+            return None
+        return {
+            "duration_s": float(metrics["flight_time_s"]), "energy": float(metrics["energy_consumption"]),
+            "distance_m": float(metrics["total_distance_m"]), "waypoints_xyz": list(metrics["waypoints_xyz"]),
+            "voxel_path": [tuple(map(int, point)) for point in path],
+            "segment_result": {
+                "start_voxel": tuple(map(int, path[0])), "goal_voxel": tuple(map(int, path[-1])),
+                "distance_m": float(metrics["total_distance_m"]), "planning_time_s": 0.0,
+                "expanded_nodes": 0, "cache_hit": True, "astar_status": "path_reuse",
+                "astar_success": True, "path_voxel_count": len(path), "voxel_path": list(path),
+            },
+        }
+
+    def _return_path_suffix(self, drone: Any, final_index: int, final: Dict[str, Any]) -> Tuple[List[Tuple[int, int, int]], bool]:
+        """Return the unflown voxel suffix when a UAV is already on its return leg."""
+        path=[tuple(map(int, point)) for point in final.get("path_voxel_path", final.get("voxel_path", []))]
+        if len(path) < 1 or int(drone.segment_index) != int(final_index):
+            return path, False
+        duration=max(float(final.get("duration", 0.0)), 1e-9)
+        remaining=max(0.0, min(duration, float(drone.segment_remaining)))
+        progress=1.0-remaining/duration
+        index=min(len(path)-1, max(0, int(math.ceil(progress*(len(path)-1)))))
+        return path[index:], True
+
+    def _plan_voxel_recovery_leg(
+        self, origin: int, recovery_node: int, *, start_voxel: Optional[Tuple[int, int, int]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Run one bounded exact recovery search through the shared voxel LRU."""
+        self._last_recovery_plan_failure_reason=None
+        context=self._voxel_context()
+        if context is None:
+            self._last_recovery_plan_failure_reason="voxel_context_unavailable"
+            return None
+        try:
+            import sys
+            from pathlib import Path
+            module_root=str(Path(__file__).resolve().parents[1] / "truck_uav_modules")
+            if module_root not in sys.path:
+                sys.path.insert(0, module_root)
+            from uav_path_planner import plan_selected_sortie_3d
+
+            planning=self.sim.cfg.get("uav_path_planning", {})
+            altitude=float(planning.get("default_task_observation_altitude_m", 20.0))
+            start_xy=self.sim.network.node_xy(int(origin))
+            goal_xy=self.sim.network.node_xy(int(recovery_node))
+            precise=plan_selected_sortie_3d(
+                (start_xy[0], start_xy[1], altitude), [], (goal_xy[0], goal_xy[1], altitude),
+                self._flight_state(), context, source="inflight_recovery_replan",
+                budget_profile="recovery_replan", start_voxel_override=start_voxel,
+            )
+            if not precise.feasible:
+                self._last_recovery_plan_failure_reason=str(precise.failure_reason or precise.termination_reason)
+                return None
+            self.replanning_stats["exact_replan_success_count"] += 1
+            return {
+                "duration_s": float(precise.flight_time_s), "energy": float(precise.energy_consumption),
+                "distance_m": float(precise.total_distance_m), "waypoints_xyz": list(precise.waypoints_xyz),
+                "voxel_path": list(precise.voxel_path),
+                "segment_result": dict((precise.segment_results or [{}])[0]),
+            }
+        except Exception as exc:
+            self._last_recovery_plan_failure_reason=f"internal_error:{type(exc).__name__}"
+            return None
+
     def _predict_entry_update(
         self, entry: Dict[str, Any], recovery_node: int
     ) -> Optional[Dict[str, float]]:
@@ -405,7 +547,11 @@ class ActiveCAVController:
                 "return_time": self.sim.network.get_drone_time(int(drone.position), int(recovery_node)),
             }
         segments = drone.sortie.segments
-        final_index = len(segments) - 1
+        final_index = next(
+            (i for i in range(len(segments) - 1, -1, -1)
+            if str(segments[i].get("type")) in {"fly", "horizontal_flight"}),
+            len(segments) - 1,
+        )
         remaining_time = 0.0
         remaining_energy = 0.0
         return_time = 0.0
@@ -416,8 +562,12 @@ class ActiveCAVController:
                 if index == drone.segment_index and drone.segment_remaining > 0.0
                 else float(segment.get("duration", 0.0))
             )
-            if index == final_index and str(segment.get("type")) == "fly":
+            if index == final_index and str(segment.get("type")) in {"fly", "horizontal_flight"}:
                 origin = int(segment.get("from", drone.position))
+                # This is candidate scoring, not a committed path.  Retain a
+                # cheap network-time estimate so ground-plan enumeration stays
+                # bounded; the selected recovery update is always replaced by
+                # ``_plan_voxel_recovery_leg`` before state is committed.
                 duration = self.sim.network.get_drone_time(origin, int(recovery_node))
                 return_time = duration
             rate = float(
@@ -428,13 +578,12 @@ class ActiveCAVController:
             )
             remaining_time += duration
             remaining_energy += duration * rate
-        if str(segments[-1].get("type")) != "fly":
+        if not any(str(segment.get("type")) in {"fly", "horizontal_flight"} for segment in segments):
             origin = int(segments[-1].get("to", drone.position))
             return_time = self.sim.network.get_drone_time(origin, int(recovery_node))
+            return_energy = return_time * float(self.sim.cfg["agents"].get("drone_fly_power", 1.0))
             remaining_time += return_time
-            remaining_energy += return_time * float(
-                self.sim.cfg["agents"].get("drone_fly_power", 1.0)
-            )
+            remaining_energy += return_energy
         reserve = float(entry.get("battery_reserve", 0.0))
         battery_at_eta = float(drone.battery) - remaining_energy
         if battery_at_eta < reserve - 1e-9:
@@ -795,48 +944,224 @@ class ActiveCAVController:
         return selected
 
     def _apply_recovery_update(self, recovery_id: str, node: int) -> bool:
+        """Atomically replace one flexible recovery target and its return leg.
+
+        Every exact recovery search is completed and battery-checked before an
+        entry, route, ETA or queue member is mutated.  Thus a timeout or node
+        budget failure leaves the old legal plan intact even when this helper
+        is invoked outside ``commit_cav_action``.
+        """
+        def retain_old(reason: str) -> bool:
+            self.replanning_stats["retained_old_plan_count"] += 1
+            self.replanning_stats[f"retained_old_plan_{str(reason).split(':', 1)[0]}_count"] += 1
+            return False
+
         locked = self._locked_prefix()
         for index, entry in enumerate(self.sim.recovery_queue):
             if self._entry_id(entry) != str(recovery_id):
                 continue
             if index < locked or not self._entry_is_flexible(index, entry):
                 return False
+            old_node=int(entry["recovery_node"])
             prediction = self._predict_entry_update(entry, int(node))
             if prediction is None:
-                return False
+                return retain_old("prediction_infeasible")
             drone = self.sim.get_drone(str(entry.get("drone_id", entry.get("uav_id"))))
-            entry["recovery_node"] = int(node)
-            entry["eta"] = float(prediction["eta"])
-            entry["battery_at_eta"] = float(prediction["battery_at_eta"])
-            if drone.sortie is not None and drone.sortie.segments:
-                final = drone.sortie.segments[-1]
-                if str(final.get("type")) == "fly":
-                    old_duration = float(final.get("duration", 0.0))
-                    origin = int(final.get("from", drone.position))
-                    new_duration = self.sim.network.get_drone_time(origin, int(node))
-                    final["to"] = int(node)
-                    final["duration"] = float(new_duration)
-                else:
-                    old_duration = 0.0
-                    origin = int(final.get("to", drone.position))
-                    new_duration = self.sim.network.get_drone_time(origin, int(node))
-                    drone.sortie.segments.append(
-                        {
-                            "type": "fly",
-                            "from": origin,
-                            "to": int(node),
-                            "duration": float(new_duration),
-                        }
+            # An entry without a physical sortie can only carry its cheap
+            # prediction; there is no airborne path to replace.
+            if drone.sortie is None or not drone.sortie.segments:
+                entry["recovery_node"] = int(node)
+                entry["eta"] = float(prediction["eta"])
+                entry["battery_at_eta"] = float(prediction["battery_at_eta"])
+                self.sim.recovery_schedule_version += 1
+                return True
+
+            final_index=next(
+                (i for i in range(len(drone.sortie.segments)-1, -1, -1)
+                if str(drone.sortie.segments[i].get("type")) in {"fly", "horizontal_flight"}),
+                None,
+            )
+            final=drone.sortie.segments[final_index] if final_index is not None else drone.sortie.segments[-1]
+            final_is_flight=str(final.get("type")) in {"fly", "horizontal_flight"}
+            origin=int(final.get("from" if final_is_flight else "to", drone.position))
+            fly_power=float(self.sim.cfg["agents"].get("drone_fly_power", 1.0))
+            old_duration=float(final.get("duration", 0.0)) if final_is_flight else 0.0
+            old_energy=float(final.get("path_energy", old_duration*fly_power)) if final_is_flight else 0.0
+            suffix, on_return_path=self._return_path_suffix(drone, final_index if final_index is not None else -1, final)
+            old_remaining=float(drone.segment_remaining) if on_return_path else old_duration
+            old_remaining_energy=old_energy*(old_remaining/max(old_duration, 1e-9)) if on_return_path else old_energy
+            planning=self.sim.cfg.get("uav_path_planning", {})
+            planned: Optional[Dict[str, Any]]=None
+            preserve_existing=False
+
+            if self._uses_voxel_recovery_planner():
+                context=self._voxel_context()
+                if context is None:
+                    return retain_old("voxel_context_unavailable")
+                try:
+                    old_goal=self._recovery_voxel(context, old_node)
+                    new_goal=self._recovery_voxel(context, int(node))
+                except Exception:
+                    return retain_old("recovery_projection_failed")
+                base_path=suffix if suffix else [tuple(map(int, p)) for p in final.get("path_voxel_path", final.get("voxel_path", []))]
+                if old_goal == new_goal:
+                    self.replanning_stats["same_target_skip_count"] += 1
+                    if base_path:
+                        planned=self._voxel_leg_from_path(context, base_path)
+                        if planned is None:
+                            return retain_old("invalid_existing_path")
+                        if on_return_path:
+                            self.replanning_stats["path_suffix_reuse_count"] += 1
+                    else:
+                        # The old exact leg remains legal because both ground
+                        # points project to the same free voxel.  Do not invent
+                        # a new ETA/energy estimate or run A*.
+                        preserve_existing=True
+                elif (
+                    base_path
+                    and self.sim.network.euclidean_distance(old_node, int(node)) < float(
+                        planning.get("recovery_replanning", {}).get("local_connection_distance_m", 20.0)
                     )
-                drone.sortie.recovery_node = int(node)
-                drone.sortie.drone_time_s += float(new_duration - old_duration)
-                fly_power = float(self.sim.cfg["agents"].get("drone_fly_power", 1.0))
-                drone.sortie.energy += float(new_duration - old_duration) * fly_power
-                drone.sortie.battery_at_eta = float(prediction["battery_at_eta"])
+                ):
+                    connection=context.local_connection(base_path[-1], new_goal)
+                    if connection is not None:
+                        planned=self._voxel_leg_from_path(context, list(base_path[:-1])+list(connection))
+                        if planned is not None:
+                            self.replanning_stats["local_connection_success_count"] += 1
+                            if on_return_path:
+                                self.replanning_stats["path_suffix_reuse_count"] += 1
+                if planned is None and base_path:
+                    # A changed road node need not be close to the old road
+                    # node for the UAV's already legal return corridor to pass
+                    # nearby.  Splice at such a point only when the remaining
+                    # local voxel connection is below the same 20 m threshold
+                    # and validates step-by-step; otherwise A* still owns the
+                    # full replan.
+                    local_radius=float(planning.get("recovery_replanning", {}).get("local_connection_distance_m", 20.0))
+                    best_path=None
+                    best_distance=math.inf
+                    for path_index, path_voxel in enumerate(base_path):
+                        dx=(int(path_voxel[2])-int(new_goal[2]))*float(context.voxel_size_xyz[0])
+                        dy=(int(path_voxel[1])-int(new_goal[1]))*float(context.voxel_size_xyz[1])
+                        dz=(int(path_voxel[0])-int(new_goal[0]))*float(context.voxel_size_xyz[2])
+                        if math.sqrt(dx*dx+dy*dy+dz*dz) >= local_radius:
+                            continue
+                        connection=context.local_connection(path_voxel, new_goal)
+                        if connection is None:
+                            continue
+                        spliced=list(base_path[:path_index+1])+list(connection[1:])
+                        candidate_path=self._voxel_leg_from_path(context, spliced)
+                        if candidate_path is not None and candidate_path["distance_m"] < best_distance:
+                            best_path=candidate_path
+                            best_distance=float(candidate_path["distance_m"])
+                    if best_path is not None:
+                        planned=best_path
+                        self.replanning_stats["local_connection_success_count"] += 1
+                        self.replanning_stats["path_splice_reuse_count"] += 1
+                        if on_return_path:
+                            self.replanning_stats["path_suffix_reuse_count"] += 1
+                if planned is None and not preserve_existing:
+                    if not self._reserve_exact_replan(drone.id):
+                        return retain_old("exact_replan_limit")
+                    planned=self._plan_voxel_recovery_leg(
+                        origin, int(node), start_voxel=base_path[0] if (on_return_path and base_path) else None,
+                    )
+                    if planned is None:
+                        return retain_old(self._last_recovery_plan_failure_reason or "exact_replan_failed")
+            elif bool(planning.get("enabled", False)):
+                # Historical non-voxel scenarios preserve their existing 2-D
+                # route behaviour; the optimization never changes that branch.
+                try:
+                    import sys
+                    from pathlib import Path
+                    module_root=str(Path(__file__).resolve().parents[1] / "truck_uav_modules")
+                    if module_root not in sys.path:
+                        sys.path.insert(0, module_root)
+                    from uav_path_planner import plan_uav_path
+                    region=planning.get("region", self.sim.cfg.get("network", {}).get("uav_path_region"))
+                    flight=self.sim.cfg.get("uav_flight", {})
+                    legacy=plan_uav_path(str(region), self.sim.network.node_xy(origin), self.sim.network.node_xy(int(node)), candidate_heights=(float(flight.get("cruise_height_m", 60.0)),))
+                    if not legacy.get("feasible", False):
+                        return retain_old("legacy_replan_failed")
+                    planned={"duration_s": float(legacy["distance_m"])/max(float(flight.get("cruise_speed_mps", self.sim.cfg["network"].get("drone_speed_mps", 14.0))), 1e-9), "energy": None, "distance_m": float(legacy["distance_m"])}
+                except Exception:
+                    return retain_old("legacy_replan_failed")
+            else:
+                planned={"duration_s": self.sim.network.get_drone_time(origin, int(node)), "energy": None, "distance_m": 0.0}
+
+            if preserve_existing:
+                # Commit only the logical ground-node alias; physical path,
+                # arrival time and energy remain the old exact values.
+                entry["recovery_node"] = int(node)
+                if final_is_flight:
+                    final["to"] = int(node)
+                drone.sortie.recovery_node=int(node)
                 drone.schedule_version += 1
+                self.sim.recovery_schedule_version += 1
+                return True
+
+            assert planned is not None
+            new_duration=float(planned["duration_s"])
+            new_energy=float(planned.get("energy") if planned.get("energy") is not None else new_duration*fly_power)
+            if self._uses_voxel_recovery_planner():
+                estimated_time=float(prediction["return_time"])
+                exact_battery=float(prediction["battery_at_eta"]) - (new_energy-estimated_time*fly_power)
+                if exact_battery < float(entry.get("battery_reserve", 0.0))-1e-9:
+                    return retain_old("battery_reserve_after_exact_path")
+                new_eta=float(prediction["eta"])+new_duration-estimated_time
+            else:
+                exact_battery=float(prediction["battery_at_eta"])
+                new_eta=float(prediction["eta"])
+
+            if final_is_flight:
+                updated_final=dict(final)
+                updated_final.update({"to": int(node), "duration": new_duration, "distance_m": float(planned["distance_m"]), "estimated": False})
+                if self._uses_voxel_recovery_planner():
+                    updated_final.update({
+                        "path_mode": "voxel_astar_3d", "waypoints_xyz": list(planned["waypoints_xyz"]),
+                        "voxel_path": list(planned["voxel_path"]), "path_voxel_path": list(planned["voxel_path"]),
+                        "path_voxel_segment": dict(planned["segment_result"]), "path_energy": new_energy,
+                    })
+                drone.sortie.segments[final_index]=updated_final
+            else:
+                updated_final={"type": "fly", "from": origin, "to": int(node), "duration": new_duration, "distance_m": float(planned["distance_m"]), "estimated": False}
+                if self._uses_voxel_recovery_planner():
+                    updated_final.update({
+                        "path_mode": "voxel_astar_3d", "waypoints_xyz": list(planned["waypoints_xyz"]),
+                        "voxel_path": list(planned["voxel_path"]), "path_voxel_path": list(planned["voxel_path"]),
+                        "path_voxel_segment": dict(planned["segment_result"]), "path_energy": new_energy,
+                    })
+                drone.sortie.segments.append(updated_final)
+
+            schedule_delta=new_duration-old_remaining
+            drone.sortie.recovery_node=int(node)
+            drone.sortie.drone_time_s += schedule_delta
+            drone.sortie.energy += new_energy-old_remaining_energy
+            drone.sortie.flight_service_energy += new_energy-old_remaining_energy
+            drone.sortie.finish_time_s += schedule_delta
+            drone.sortie.battery_at_eta=exact_battery
+            if on_return_path:
+                drone.segment_remaining=new_duration
+            entry["recovery_node"] = int(node)
+            entry["eta"] = new_eta
+            entry["battery_at_eta"] = exact_battery
+            drone.schedule_version += 1
             self.sim.recovery_schedule_version += 1
             return True
         return False
+
+    def _coalesced_recovery_updates(self, updates: Dict[str, int]) -> List[Tuple[str, int]]:
+        """Keep the last target for each UAV at one simulation timestamp."""
+        by_drone: Dict[str, Tuple[str, int]] = {}
+        for recovery_id, node in updates.items():
+            entry=next((item for item in self.sim.recovery_queue if self._entry_id(item) == str(recovery_id)), None)
+            if entry is None:
+                continue
+            drone_id=str(entry.get("drone_id", entry.get("uav_id")))
+            if drone_id in by_drone:
+                self.replanning_stats["merged_request_count"] += 1
+            by_drone[drone_id]=(str(recovery_id), int(node))
+        return list(by_drone.values())
 
     def commit_cav_action(
         self, candidate: GroundCandidate, *, validate_fingerprint: bool = True
@@ -859,7 +1184,7 @@ class ActiveCAVController:
             int(self.sim.recovery_schedule_version),
         )
         try:
-            for recovery_id, node in candidate.recovery_updates.items():
+            for recovery_id, node in self._coalesced_recovery_updates(candidate.recovery_updates):
                 if not self._apply_recovery_update(recovery_id, node):
                     raise ValueError("recovery_update_became_infeasible")
             old_target = vehicle.target_node

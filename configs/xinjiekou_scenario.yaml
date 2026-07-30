@@ -1,0 +1,51 @@
+base: training_base.yaml
+project:
+  name: dynamic_patrol_default
+  results_dir: results/default_training
+experiment:
+  scenario_name: xinjiekou_default
+  time_mode: event_driven
+  output_dir: results/default_training
+network:
+  type: xinjiekou_graphml
+  graphml_file: truck_uav_modules/data/xinjiekou/road_network.graphml
+  buildings_file: truck_uav_modules/data/xinjiekou/buildings.geojson
+  launch_recovery_file: truck_uav_modules/data/xinjiekou/launch_recovery_nodes.geojson
+  expected_node_count: 333
+  expected_edge_count: 601
+  directed: true
+  map_version: xinjiekou_default_v1
+  max_launch_recovery_match_distance_m: 5.0
+  patrol_center: center
+  drone_speed_mps: 10.0
+time:
+  mode: event_driven
+uav_flight:
+  cruise_height_m: 60.0
+  climb_speed_mps: 3.0
+  descent_speed_mps: 2.0
+  cruise_speed_mps: 10.0
+  climb_power: 1.0
+  cruise_power: 1.0
+  descent_power: 1.0
+  service_power: 0.85
+  hover_power: 0.65
+uav_path_planning:
+  enabled: false
+  region: xinjiekou
+  candidate_estimation_factor: 1.15
+  plan_only_selected_sortie: true
+  revalidate_before_commit: true
+  use_path_cache: true
+  planner_mode: visibility_graph
+  # Passed through to the local visibility-graph planner for every selected
+  # sortie; it is not used during candidate-distance estimation.
+  search_buffer_m: 15.0
+task_generation:
+  # Explicit smoke-only business-segment to real compressed-road mapping.
+  smoke_edge_overrides:
+    xjk_insp_000172: compressed_edge_000000
+    xjk_insp_000238: compressed_edge_000001
+    xjk_insp_000313: compressed_edge_000002
+    xjk_insp_000507: compressed_edge_000003
+    xjk_insp_000550: compressed_edge_000004

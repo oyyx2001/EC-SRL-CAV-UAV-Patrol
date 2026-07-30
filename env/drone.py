@@ -22,6 +22,14 @@ class Drone:
     completed_task_ids: List[int] = field(default_factory=list)
     log: List[Tuple[float, str, int]] = field(default_factory=list)
     schedule_version: int = 0
+    active_voxel_path: List[Tuple[int, int, int]] = field(default_factory=list)
+    active_path_xyz: List[Tuple[float, float, float]] = field(default_factory=list)
+    path_total_distance_m: float = 0.0
+    path_total_flight_time_s: float = 0.0
+    path_segment_index: int = 0
+    path_progress_m: float = 0.0
+    task_arrival_times: Dict[int, float] = field(default_factory=dict)
+    recovery_eta: Optional[float] = None
 
     def is_idle(self) -> bool:
         return self.status == "idle"
@@ -34,6 +42,7 @@ class Drone:
         self.sortie = None
         self.segment_index = 0
         self.segment_remaining = 0.0
+        self.active_voxel_path.clear(); self.active_path_xyz.clear(); self.task_arrival_times.clear(); self.recovery_eta = None
         self.log.append((now, "recovered", int(node)))
 
     def assign_sortie(self, sortie: Any, now: float) -> None:
@@ -44,4 +53,7 @@ class Drone:
         self.status = "flying"
         self.segment_index = 0
         self.segment_remaining = sortie.segments[0]["duration"] if sortie.segments else 0.0
+        self.active_voxel_path = list(getattr(sortie, "active_voxel_path", [])); self.active_path_xyz = list(getattr(sortie, "active_path_xyz", []))
+        self.path_total_distance_m = float(getattr(sortie, "actual_distance_m", 0.0)); self.path_total_flight_time_s = float(getattr(sortie, "actual_flight_time_s", 0.0))
+        self.path_segment_index = 0; self.path_progress_m = 0.0; self.task_arrival_times = dict(getattr(sortie, "task_arrival_times", {})); self.recovery_eta = getattr(sortie, "recovery_eta", None)
         self.log.append((now, "launch", sortie.launch_node))

@@ -22,6 +22,8 @@ class ReplayBatch:
     bootstrap_discounts: torch.Tensor
     decision_times: torch.Tensor
     instantaneous_dispatches: torch.Tensor
+    trigger_event_types: np.ndarray | None = None
+    sampled_priorities: torch.Tensor | None = None
     indices: torch.Tensor | None = None
     weights: torch.Tensor | None = None
 
@@ -56,7 +58,7 @@ class MaskedReplayBuffer:
         self.bootstrap_discounts = np.zeros(self.capacity, dtype=np.float32)
         self.decision_times = np.zeros(self.capacity, dtype=np.float64)
         self.instantaneous_dispatches = np.zeros(self.capacity, dtype=bool)
-        self.trigger_event_types = np.full(self.capacity, "", dtype="<U64")
+        self.trigger_event_types = np.full(self.capacity, "", dtype="<U256")
         self.default_transition_discount = float(default_transition_discount)
         self.time_mode = str(time_mode)
         self.require_time_fields = bool(require_time_fields)
@@ -100,7 +102,7 @@ class MaskedReplayBuffer:
             self.default_transition_discount if transition_discount is None else transition_discount
         )
         self.decision_times[idx] = float(decision_time)
-        self.trigger_event_types[idx] = str(trigger_event_type)[:64]
+        self.trigger_event_types[idx] = str(trigger_event_type)[:256]
         self.instantaneous_dispatches[idx] = bool(instantaneous_dispatch)
         self.action_masks[idx] = np.asarray(action_mask, dtype=bool)
         self.next_action_masks[idx] = np.asarray(next_action_mask, dtype=bool)
@@ -128,6 +130,7 @@ class MaskedReplayBuffer:
             bootstrap_discounts=torch.as_tensor(self.bootstrap_discounts[idx], device=device),
             decision_times=torch.as_tensor(self.decision_times[idx], device=device),
             instantaneous_dispatches=torch.as_tensor(self.instantaneous_dispatches[idx], device=device, dtype=torch.bool),
+            trigger_event_types=self.trigger_event_types[idx].copy(),
         )
 
     def state_dict(self) -> Dict[str, int]:
@@ -234,6 +237,8 @@ class PrioritizedMaskedReplayBuffer(MaskedReplayBuffer):
             bootstrap_discounts=torch.as_tensor(self.bootstrap_discounts[idx], device=device),
             decision_times=torch.as_tensor(self.decision_times[idx], device=device),
             instantaneous_dispatches=torch.as_tensor(self.instantaneous_dispatches[idx], device=device, dtype=torch.bool),
+            trigger_event_types=self.trigger_event_types[idx].copy(),
+            sampled_priorities=torch.as_tensor(self.priorities[idx], device=device, dtype=torch.float32),
             indices=torch.as_tensor(idx, device=device, dtype=torch.long),
             weights=torch.as_tensor(weights, device=device, dtype=torch.float32),
         )

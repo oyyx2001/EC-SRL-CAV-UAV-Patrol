@@ -1,0 +1,33 @@
+{
+  "scene": "baijiahu",
+  "crs": "EPSG:32650",
+  "grid_size_m": 10.0,
+  "rows": 260,
+  "cols": 260,
+  "bounds": {
+    "min_x": 669815.4694357647,
+    "min_y": 3533729.1180260275,
+    "max_x": 672415.4694357647,
+    "max_y": 3536329.1180260275
+  },
+  "map_padding_m": 50.0,
+  "all_touched": true,
+  "horizontal_safety_buffer_m": 0.0,
+  "vertical_safety_margin_m": 0.0,
+  "layers_m": [
+    20,
+    40,
+    60,
+    80,
+    100,
+    120
+  ],
+  "transform": [
+    10.0,
+    0.0,
+    669815.4694357647,
+    0.0,
+    -10.0,
+    3536329.1180260275
+  ]
+}

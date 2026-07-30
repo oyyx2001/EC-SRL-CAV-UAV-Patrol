@@ -23,7 +23,7 @@ class Task:
     priority: float
     service_time: float
     executor: str = "drone"  # drone, vehicle, both
-    status: str = "unreleased"  # unreleased, unassigned, assigned, executing, done, expired
+    status: str = "unreleased"  # unreleased, unassigned, assigned, executing, done, expired, censored
     assigned_to: Optional[str] = None
     start_time: Optional[float] = None
     completion_time: Optional[float] = None
@@ -64,7 +64,15 @@ class TaskGenerator:
         self.next_id = 0
 
     def generate_episode_tasks(self) -> List[Task]:
-        horizon = float(self.cfg["simulation"].get("horizon_s", 3600))
+        # ``horizon_s`` remains the legacy one-window setting.  Stage 5 can
+        # split it into a release window plus a drain window; only the former
+        # may create tasks.
+        horizon = float(
+            self.cfg["simulation"].get(
+                "task_release_horizon_s",
+                self.cfg["simulation"].get("horizon_s", 3600),
+            )
+        )
         tasks: List[Task] = []
         tasks.extend(self._routine_tasks(horizon))
         tasks.extend(self._poisson_tasks(horizon, TASK_INCIDENT))
