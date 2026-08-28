@@ -1,3 +1,0 @@
-scene,trial_id,dijkstra_time_ms,astar_time_ms,dijkstra_cost_m,astar_cost_m,cost_equal,dijkstra_path_found,astar_path_found,dijkstra_expanded_nodes,astar_expanded_nodes,dijkstra_generated_nodes,astar_generated_nodes,time_saved_ms,speedup_ratio,expanded_node_reduction
-xinjiekou,1,896.4415,54.1527,228.27699279785156,228.27699279785156,True,True,True,11116,538,14373,2680,842.2888,16.55395760506863,0.9516012954300108
-baijiahu,1,1327.3694,243.9334,230.2458038330078,230.2458038330078,True,True,True,11308,583,13462,1827,1083.4360000000001,5.44152379296972,0.9484435797665369

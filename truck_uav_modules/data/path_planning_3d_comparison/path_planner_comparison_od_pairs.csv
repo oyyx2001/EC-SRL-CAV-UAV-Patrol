@@ -1,3 +1,0 @@
-scene,trial_id,start_z,start_row,start_col,goal_z,goal_row,goal_col,start_altitude_m,goal_altitude_m,horizontal_distance_m,vertical_distance_m,straight_3d_distance_m,component_id,random_seed
-xinjiekou,1,8,237,129,4,220,118,85.0,45.0,202.48456731316588,40.0,206.39767440550293,0,20260728
-baijiahu,1,4,113,248,10,94,245,45.0,105.0,192.35384061671346,60.0,201.49441679609885,0,20260728

@@ -28,6 +28,16 @@ outputs/
 # Local tooling and review artifacts
 .codex_work/
 tmp/
+manuscript/rendered/page-*.png
+
+# Generated map, benchmark, and visualization artifacts
+data/jiangning_osm/
+truck_uav_modules/figure/
+truck_uav_modules/data/path_planning_benchmark/
+truck_uav_modules/data/path_planning_3d_benchmark/
+truck_uav_modules/data/path_planning_3d_comparison/
+truck_uav_modules/data/processed_3d_voxel_grids_road_clearance_v1/
+truck_uav_modules/data/processed_3d_voxel_grids_road_free_20_120m/
 
 # Model/checkpoint artifacts
 *.pt
