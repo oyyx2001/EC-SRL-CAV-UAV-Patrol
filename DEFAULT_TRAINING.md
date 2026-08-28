@@ -1,15 +1,26 @@
 # Default Rainbow DQN training
 
-The training entry now loads `configs/default_training.yaml` automatically.
+The training entry loads `configs/default_training.yaml` automatically, so the
+default scene is Xinjiekou.
 
 ```powershell
-D:\ProgramData\Anaconda3\envs\gym\python.exe -B -m rl.train_masked_dqn `
+python -B -m rl.train_masked_dqn `
   --seed 42 `
   --max-episodes 30 `
   --disable-tensorboard
 ```
 
-The config supplies the default output directory, run name, model name, map,
-task registry, reward weights, and Rainbow hyperparameters. To override one of
-them, add the corresponding command-line option. To use another configuration,
-add `--config configs\another_config.yaml`.
+To train on Baijiahu with the same model, reward, task-generation, and
+time-aware discount settings:
+
+```powershell
+python -B -m rl.train_masked_dqn `
+  --config configs\baijiahu_training.yaml `
+  --seed 42 `
+  --max-episodes 30 `
+  --disable-tensorboard
+```
+
+Each scene configuration supplies its output directory, run name, model name,
+map, and task registry. Command-line options can still override run-specific
+values.

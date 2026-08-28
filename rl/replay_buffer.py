@@ -89,6 +89,10 @@ class MaskedReplayBuffer:
                 "event-driven replay requires explicit delta_t and transition_discount; "
                 "refusing to silently apply a fixed-step discount"
             )
+        if delta_t is not None and (not np.isfinite(float(delta_t)) or float(delta_t) < 0.0):
+            raise ValueError(f"delta_t must be finite and non-negative, got {delta_t}")
+        if transition_discount is not None and not np.isfinite(float(transition_discount)):
+            raise ValueError(f"transition_discount must be finite, got {transition_discount}")
         idx = self.pos
         self.obs[idx] = np.asarray(obs, dtype=np.float32)
         self.next_obs[idx] = np.asarray(next_obs, dtype=np.float32)

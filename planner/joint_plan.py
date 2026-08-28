@@ -157,7 +157,8 @@ class JointPlanFeatureBuilder:
         ground_code = {"keep_route": 0.0, "wait": 1.0 / 3.0, "move_to": 2.0 / 3.0, "reroute": 1.0}.get(
             plan.ground_candidate.action_type, 0.0
         )
-        locked = sim.recovery_scheduler.locked_prefix_length(sim.recovery_queue)
+        queue_aware_recovery = bool(sim.cfg.get("ablation", {}).get("queue_aware_recovery", True))
+        locked = sim.recovery_scheduler.locked_prefix_length(sim.recovery_queue) if queue_aware_recovery else 0
         pending = len(sim.task_pool.active_tasks())
         high_threshold = float(sim.cfg.get("simulation", {}).get("high_priority_threshold", 8))
         high_count = sum(float(task.priority) >= high_threshold for task in sim.task_pool.active_tasks())
@@ -186,14 +187,14 @@ class JointPlanFeatureBuilder:
             plan.predicted_detour_ratio,
             float(plan.route_switch_flag),
             ground_code,
-            plan.predicted_recovery_wait / self.time_scale,
-            plan.predicted_cav_wait / self.time_scale,
-            plan.predicted_existing_queue_delay / self.time_scale,
+            (plan.predicted_recovery_wait / self.time_scale) if queue_aware_recovery else 0.0,
+            (plan.predicted_cav_wait / self.time_scale) if queue_aware_recovery else 0.0,
+            (plan.predicted_existing_queue_delay / self.time_scale) if queue_aware_recovery else 0.0,
             plan.predicted_hover_energy / self.energy_scale,
-            insertion_cost / self.time_scale,
+            (insertion_cost / self.time_scale) if queue_aware_recovery else 0.0,
             plan.predicted_rendezvous_slack / self.time_scale,
             plan.predicted_min_recovery_slack / self.time_scale,
-            plan.queue_length_after / max(1.0, len(sim.drones)),
+            (plan.queue_length_after / max(1.0, len(sim.drones))) if queue_aware_recovery else 0.0,
             locked / max(1.0, len(sim.drones)),
             len(sim.idle_drones_on_vehicle()) / max(1.0, len(sim.drones)),
             pending / self.task_scale,
@@ -300,8 +301,8 @@ class JointPlanGenerator:
             ]
         return sim.sortie_generator.generate_all(
             drones, sim.vehicle.position, sim.now, available,
-            recovery_anchor_node=sim.recovery_queue_anchor_node(),
-            vehicle_queue_time_s=sim.recovery_queue_travel_time_s(),
+            recovery_anchor_node=(sim.recovery_queue_anchor_node() if bool(sim.cfg.get("ablation", {}).get("queue_aware_recovery", True)) else sim.vehicle.position),
+            vehicle_queue_time_s=(sim.recovery_queue_travel_time_s() if bool(sim.cfg.get("ablation", {}).get("queue_aware_recovery", True)) else 0.0),
             allow_recovery_reschedule=sim.dynamic_insertion_enabled,
             decision_epoch_id=context.get("decision_epoch_id"),
         )
@@ -342,6 +343,30 @@ class JointPlanGenerator:
         return trial
 
     def _ground_override(self, ground: GroundCandidate) -> Dict[str, Any]:
+        # In queue-blind mode the physical FIFO queue remains a safety oracle,
+        # but it must not affect candidate generation, candidate scores, or
+        # policy-visible features.  Build a private validator-only arrival
+        # estimate without changing the policy candidate's planned route.
+        if not bool(self.sim.cfg.get("ablation", {}).get("queue_aware_recovery", True)):
+            queue = deepcopy(self.sim.recovery_queue)
+            now = float(self.sim.now)
+            wait_duration = max(0.0, float(ground.wait_until or now) - now)
+            route = list(ground.planned_route) or [int(self.sim.vehicle.position)]
+            route_end = int(route[-1])
+            route_time = sum(
+                float(self.sim.network.G[int(u)][int(v)]["vehicle_time_s"])
+                for u, v in zip(route[:-1], route[1:])
+            )
+            if queue:
+                first_node = int(queue[0]["recovery_node"])
+                tail = self.sim.network.get_vehicle_path(route_end, first_node)
+                if not tail:
+                    return {"queue": queue, "first_cav_arrival_time": math.inf}
+                route_time += sum(
+                    float(self.sim.network.G[int(u)][int(v)]["vehicle_time_s"])
+                    for u, v in zip(tail[:-1], tail[1:])
+                )
+            return {"queue": queue, "first_cav_arrival_time": now + wait_duration + route_time}
         queue, reason = self.sim.ground_controller._trial_queue(ground)
         if reason is not None:
             return {"queue": queue, "first_cav_arrival_time": math.inf}
@@ -433,12 +458,15 @@ class JointPlanGenerator:
             "recovery": float(self.cost_cfg.get("weight_recovery", 0.5)),
             "stability": float(self.cost_cfg.get("weight_stability", 0.2)),
         }
+        recovery_score = weights["recovery"] * plan.predicted_recovery_wait / 60.0
+        if not bool(self.sim.cfg.get("ablation", {}).get("queue_aware_recovery", True)):
+            recovery_score = 0.0
         plan.pre_score = (
             -weights["task"] * plan.task_benefit
             + weights["uav"] * plan.predicted_uav_energy / 100.0
             + weights["return"] * plan.predicted_uav_return_distance / 1000.0
             + weights["cav"] * plan.predicted_cav_time / 60.0
-            + weights["recovery"] * plan.predicted_recovery_wait / 60.0
+            + recovery_score
             + weights["stability"] * float(plan.route_switch_flag)
         )
         plan.features = self.feature_builder.build(plan, context)
@@ -926,6 +954,14 @@ class JointPlanGenerator:
         }
         total_generated_typed = max(1, sum(generated_by_type.values()))
         successful_commits = [row for row in self.commit_log if bool(row.get("success"))]
+        path_failure_reasons = {
+            "selected_sortie_real_path_infeasible",
+            "selected_sortie_post_plan_revalidation_failed",
+        }
+        path_planning_failure_count = sum(
+            str(row.get("reason", row.get("fallback_reason", ""))) in path_failure_reasons
+            for row in self.commit_log
+        )
         ground_action_counts = {
             action: sum(row.get("ground_action") == action for row in successful_commits)
             for action in ("keep_route", "wait", "move_to", "reroute")
@@ -954,6 +990,7 @@ class JointPlanGenerator:
             "return_guard_rejection_rate": self.return_guard_rejections / max(1, self.return_guard_evaluations),
             "commit_failure_count": self.commit_failures, "rollback_count": self.rollback_count,
             "atomic_commit_failure_rate": self.commit_failures / max(1, len(self.commit_log)),
+            "path_planning_failure_count": int(path_planning_failure_count),
             "rollback_rate": self.rollback_count / max(1, len(self.commit_log)),
             "candidate_truncation_count": self.candidate_truncation_count,
             "stale_plan_cache_count": self.stale_cache_count, "mask_inconsistency_count": self.mask_inconsistency_count,

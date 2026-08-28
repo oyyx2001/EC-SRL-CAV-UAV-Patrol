@@ -1,61 +1,97 @@
-# Default training configuration for the current Xinjiekou Rainbow DQN setup.
-base: candidate_generation.yaml
+# Canonical default configuration for Xinjiekou Rainbow DQN training.
+# Keep this file self-contained: formal_training.yaml may override run-specific
+# values, but active training must not depend on historical config layers.
 
 project:
   name: dynamic_patrol_default
+  seed: 42
   results_dir: results/default_training
   tensorboard_dir: results/default_training/tensorboard
 
-# Stage 5 reward overlay.  It applies only to this current Xinjiekou-333
-# experiment and keeps the reward ledger's increment-based accounting.
-reward:
-  mode: stage5_coordinated
-  accounting_mode: interval_increment
-  stage5_references:
-    time_s: 60.0
-    return_distance_m: 1000.0
-    cav_distance_m: 1000.0
-  stage5_weights:
-    complete: 30.0
-    priority: 2.0
-    # Each expired task receives -(30 + 2 * task.priority), symmetric with
-    # the corresponding completion and priority reward.
-    timeout: 30.0
-    timeout_priority: 2.0
-    aoi: 0.001
-    flight_energy: 0.002
-    hover_energy: 0.002
-    return_distance: 1.0
-    cav_distance: 0.4
-    recovery_wait: 0.25
-    recovery_queue: 0.12
-    route_change: 0.15
-    route_reverse: 0.50
-    coordination_failure: 30.0
+experiment:
+  scenario_name: xinjiekou_default
+  time_mode: event_driven
+  output_dir: results/default_training
+
+simulation:
+  horizon_s: 3600
+  task_release_horizon_s: 10800
+  drain_phase_enabled: true
+  max_drain_time_s: 1800
+  decision_interval_s: 60
+  dt_s: 10
+  high_priority_threshold: 8
+
+time:
+  mode: event_driven
+
+network:
+  type: xinjiekou_graphml
+  graphml_file: truck_uav_modules/data/xinjiekou/road_network.graphml
+  buildings_file: truck_uav_modules/data/xinjiekou/buildings.geojson
+  launch_recovery_file: truck_uav_modules/data/xinjiekou/launch_recovery_nodes.geojson
+  expected_node_count: 333
+  expected_edge_count: 601
+  directed: true
+  map_version: xinjiekou_default_v1
+  max_launch_recovery_match_distance_m: 5.0
+  patrol_center: center
+  vehicle_speed_mps: 8.3
+  drone_speed_mps: 10.0
+
+agents:
+  num_vehicles: 1
+  num_drones: 3
+  drone_battery_capacity: 1800.0
+  drone_fly_power: 1.0
+  drone_hover_power: 0.65
+  drone_service_power: 0.85
+  battery_swap_time_s: 0
+  launch_time_s: 0
+  recovery_time_s: 0
+
+uav_flight:
+  cruise_height_m: 60.0
+  climb_speed_mps: 3.0
+  descent_speed_mps: 2.0
+  cruise_speed_mps: 10.0
+  climb_power: 1.0
+  cruise_power: 1.0
+  descent_power: 1.0
+  service_power: 0.85
+  hover_power: 0.65
 
 uav_path_planning:
-  # Used in the LRU key to prevent a route from another voxel build being
-  # reused after the map has been regenerated.
-  map_version: xinjiekou_voxel_map_3d_v1
-  path_cache_max_entries: 1024
-  # A legal elevated corridor can be much longer than the cost-optimal route;
-  # retain the implementation for ablation, but keep it off in the quality
-  # comparison run.
-  enable_validated_elevated_corridor: false
-  # Weighted Euclidean ordering preserves the same voxel graph, 26-neighbour
-  # moves and corner checks, while finding a valid bounded path faster.
+  enabled: true
+  planner_type: voxel_astar_3d
+  region: xinjiekou
+  voxel_map_dir: truck_uav_modules/data/xinjiekou/voxel_map_3d
+  voxel_size_m: 10.0
+  voxel_size_z_m: 20.0
+  min_operational_altitude_m: 20.0
+  max_operational_altitude_m: 120.0
+  launch_altitude_m: 20.0
+  recovery_altitude_m: 20.0
+  default_task_observation_altitude_m: 20.0
+  neighbor_mode: 26
+  prevent_corner_cutting: true
+  heuristic: euclidean
   runtime_heuristic_weight: 2.0
+  use_path_cache: true
+  path_cache_max_entries: 1024
+  map_version: xinjiekou_voxel_map_3d_v1
+  candidate_estimation_factor: 1.15
+  plan_only_selected_sortie: true
+  revalidate_before_commit: true
+  fallback_to_2d_planner: false
+  fallback_to_next_candidate: false
+  enable_validated_elevated_corridor: false
+  search_buffer_m: 15.0
   planning_budget:
     enabled: true
-    # A sampled wall-clock guard has negligible overhead; the core also
-    # enforces expanded-node ceilings exactly.
     check_interval_expansions: 64
     profiles:
       materialization:
-        # Apply the requested bound to every exact leg.  A selected sortie may
-        # contain several legs, so sharing one second across the full itinerary
-        # would reject otherwise legal multi-task sorties before their later
-        # A* requests even start.
         enforce_sortie_deadline: false
         max_sortie_planning_time_ms: 1000.0
         max_segment_planning_time_ms: 1000.0
@@ -64,21 +100,192 @@ uav_path_planning:
         max_sortie_planning_time_ms: 500.0
         max_segment_planning_time_ms: 500.0
         max_expanded_nodes_per_segment: 50000
+  road_clearance:
+    enabled: true
+    road_buffer_m: 10.0
+    force_free_above_road: true
+    min_clearance_altitude_m: 20.0
+    max_clearance_altitude_m: 120.0
+  point_projection:
+    prefer_road_clearance_voxels: true
+    max_horizontal_projection_m: 20.0
+    max_vertical_projection_m: 40.0
   recovery_replanning:
     local_connection_distance_m: 20.0
     max_exact_replans_per_uav_per_decision: 1
     max_exact_replans_system_per_decision: 4
 
-recovery_replanning_optimization:
-  baseline:
-    seed: 42
-    task_count: 72
-    episode_total_time_s: 377.5779963
-    voxel_astar_call_count: 178
-    voxel_astar_total_time_s: 338.019
-    simulation_and_state_update_time_s: 232.433
-    selected_sortie_materialization_time_s: 129.294
-    completion_rate: 0.9861111111
-    episode_reward: 2623.4927786225876
-    illegal_actions: 0
-    commit_failures: 0
+edge_tasks:
+  mapping_mode: direct_compressed_edge
+  registry_path: data/xinjiekou/edge_task_registry.csv
+  edge_selection:
+    eligible_only: true
+    exclude_self_loops: true
+    exclude_zero_length: true
+    fixed_seed: 2026
+  periodic_patrol:
+    selected_segment_count: 10
+    batch_size: 2
+    revisit_interval_s: 1800
+    cycle_count: 6
+    priority: 2
+    deadline_s: 1800
+    service_duration_s: 30.0
+  dynamic_tasks:
+    incident_confirmation:
+      process: homogeneous_poisson
+      arrival_rate_per_hour: 2.0
+      priority: 10
+      deadline_s: 420
+    congestion_anomaly_scan:
+      process: fixed_count_piecewise_random
+      total_count: 12
+      time_segments:
+        - start_s: 0
+          end_s: 3600
+          task_count: 2
+        - start_s: 3600
+          end_s: 7200
+          task_count: 8
+        - start_s: 7200
+          end_s: 10800
+          task_count: 2
+      priority: 6
+      deadline_s: 600
+    road_obstruction_inspection:
+      release_mode: poisson
+      rate_per_hour: 2.0
+      deadline_s: 300.0
+      priority: 8.0
+      service_duration_s: 35.0
+    critical_period_patrol:
+      release_mode: fixed_times
+      release_times_s: [900.0, 4500.0, 8100.0]
+      deadline_s: 360.0
+      priority: 6.0
+      service_duration_s: 40.0
+
+decision_mode: joint_plan
+
+cav_control:
+  mode: joint_plan
+  action_set: [keep_route, wait, move_to, reroute]
+  max_ground_candidates: 8
+
+joint_plan:
+  max_non_safe_plans: 24
+  max_ground_candidates: 4
+  max_sorties_per_ground: 6
+  max_insertions_per_pair: 1
+  type_quotas: {type_I: 12, type_II: 8, type_III: 4}
+
+uav_return_guard:
+  enabled: true
+  max_return_distance_increase_ratio: 0.75
+  return_distance_floor_m: 100
+  enforce_energy_feasibility: true
+  minimum_battery_slack: 0
+
+recovery:
+  rule: fifo
+
+recovery_insertion:
+  enabled: false
+  lock_horizon_s: 120
+  preserve_locked_prefix: true
+  weight_uav_wait: 1.0
+  weight_existing_delay: 0.5
+  weight_cav_wait: 0.25
+  weight_route_time: 0.10
+  battery_reserve: 0.0
+  use_battery_feasibility: true
+  cache_candidate_evaluation: true
+  log_insertion_details: true
+
+sortie:
+  top_k_per_drone: 12
+  max_tasks_per_sortie: 3
+  recovery_candidates: 12
+  recovery_center_radius_m: 2600
+  recovery_candidate_mode: mixed
+  allow_multi_task: true
+  candidate_pool_tasks: 12
+
+candidate_generation:
+  optimization_enabled: true
+  max_prefiltered_tasks_per_uav: 6
+  max_recovery_nodes_per_sequence: 3
+  max_full_evaluations_per_uav: 100
+  final_top_k_per_uav: 12
+  enable_task_prefilter: true
+  enable_incremental_pruning: true
+  enable_connectivity_filter: true
+  enable_recovery_prefilter: true
+  enable_distance_cache: true
+  enable_cav_eta_cache: true
+  enable_bounded_top_k: true
+  enable_candidate_deduplication: true
+  enable_joint_plan_deduplication: true
+  preserve_high_priority_tasks: true
+  high_priority_threshold: 8.0
+  preserve_urgent_tasks: true
+  urgent_deadline_threshold_s: 300.0
+  connectivity_labels_file: null
+  connectivity_node_voxels_file: null
+
+reward:
+  mode: stage5_coordinated
+  accounting_mode: interval_increment
+  normalization: {enabled: false, scale_version: xinjiekou-default-unscaled-v1}
+  stage5_references:
+    time_s: 60.0
+    return_distance_m: 1000.0
+    cav_distance_m: 1000.0
+  stage5_weights:
+    complete: 30.0
+    priority: 2.0
+    timeout: 30.0
+    timeout_priority: 2.0
+    aoi: 0.02
+    flight_energy: 0.003
+    hover_energy: 0.003
+    return_distance: 1.0
+    cav_distance: 0.4
+    recovery_wait: 0.25
+    recovery_queue: 0.12
+    route_change: 0.15
+    route_reverse: 0.50
+    coordination_failure: 30.0
+    illegal_action: 30.0
+
+rl:
+  algo: rainbow_dqn
+  timesteps: 100000
+  run_name: rainbow_default
+  model_name: rainbow_dqn_default.pt
+  action_masking: true
+  train_scenario: xinjiekou_default
+  eval_scenario: xinjiekou_default_eval
+  eval_seeds: [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1018, 1019]
+  discount_mode: time_aware
+  gamma: 0.99
+  discount_reference_time_s: 60.0
+  n_step: 1
+  hyperparams:
+    candidate_dim: 38
+    batch_size: 128
+    replay_buffer_size: 100000
+    learning_starts: 1000
+    target_update_interval: 2000
+    eval_interval: 10000
+    checkpoint_interval: 10000
+    diagnostic_sample_stride: 1
+
+training:
+  seed_mode: random
+  task_mapping_version: xinjiekou_direct_edge_default_v1
+  path_planner_version: voxel_astar_3d_default_v1
+  map_version: xinjiekou_voxel_map_3d_v1
+
+visualization:
+  dpi: 160

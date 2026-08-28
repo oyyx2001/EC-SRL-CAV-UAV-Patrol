@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import geopandas as gpd
+import networkx as nx
 import numpy as np
 import pandas as pd
 import yaml
@@ -102,6 +103,296 @@ def load_edge_task_registry(network: RoadNetwork, registry_path: str) -> pd.Data
     return registry.sort_values("edge_id", kind="mergesort").reset_index(drop=True)
 
 
+def incident_confirmation_release_times(
+    *,
+    arrival_rate_per_hour: float,
+    release_horizon_s: float,
+    seed: int,
+) -> List[float]:
+    """Generate a scene-independent homogeneous Poisson arrival stream."""
+
+    rate_per_s = float(arrival_rate_per_hour) / 3600.0
+    if rate_per_s < 0.0 or not math.isfinite(rate_per_s):
+        raise ValueError("incident_confirmation arrival_rate_per_hour must be finite and non-negative")
+    if float(release_horizon_s) < 0.0 or not math.isfinite(float(release_horizon_s)):
+        raise ValueError("incident_confirmation release_horizon_s must be finite and non-negative")
+    if rate_per_s == 0.0:
+        return []
+
+    arrival_rng = np.random.default_rng(np.random.SeedSequence([int(seed), 0x494E4349]))
+    releases: List[float] = []
+    release = 0.0
+    mean_interarrival_s = 1.0 / rate_per_s
+    while True:
+        release += float(arrival_rng.exponential(mean_interarrival_s))
+        if release >= float(release_horizon_s):
+            break
+        releases.append(release)
+    return releases
+
+
+def congestion_anomaly_release_times(
+    *,
+    time_segments: List[Dict[str, Any]],
+    total_count: int,
+    release_horizon_s: float,
+    seed: int,
+) -> List[float]:
+    """Generate a scene-independent fixed-count piecewise-uniform schedule."""
+
+    if int(total_count) < 0:
+        raise ValueError("congestion_anomaly_scan total_count must be non-negative")
+    segment_count = sum(int(segment.get("task_count", 0)) for segment in time_segments)
+    if segment_count != int(total_count):
+        raise ValueError(
+            f"congestion_anomaly_scan time segments contain {segment_count} tasks, "
+            f"but total_count={total_count}"
+        )
+
+    release_rng = np.random.default_rng(np.random.SeedSequence([int(seed), 0x434F4E47]))
+    releases: List[float] = []
+    previous_end = 0.0
+    for segment_index, segment in enumerate(time_segments):
+        start = float(segment["start_s"])
+        end = float(segment["end_s"])
+        count = int(segment["task_count"])
+        if count < 0 or start < 0.0 or end <= start or end > float(release_horizon_s):
+            raise ValueError(f"Invalid congestion_anomaly_scan time segment {segment_index}: {segment}")
+        if segment_index > 0 and start < previous_end:
+            raise ValueError("congestion_anomaly_scan time segments must not overlap")
+        releases.extend(release_rng.uniform(start, end, size=count).tolist())
+        previous_end = end
+    return sorted(float(release) for release in releases)
+
+
+def _road_classes(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip().lower() for item in value if str(item).strip()]
+    if value is None:
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        decoded = None
+    if isinstance(decoded, list):
+        return [str(item).strip().lower() for item in decoded if str(item).strip()]
+    return [part.strip().lower() for part in text.replace(";", ",").split(",") if part.strip()]
+
+
+def build_incident_sampling_pool(network: RoadNetwork, eligible_registry: pd.DataFrame) -> pd.DataFrame:
+    """Attach auditable road-class, length and centrality sampling weights."""
+
+    pool = eligible_registry.copy().sort_values("edge_id", kind="mergesort").reset_index(drop=True)
+    pool["physical_road_key"] = pool.apply(
+        lambda row: "|".join(sorted((str(row["u_external_id"]), str(row["v_external_id"])))),
+        axis=1,
+    )
+    pool = pool.drop_duplicates(subset=["physical_road_key"], keep="first").reset_index(drop=True)
+    if pool.empty:
+        raise ValueError("No unique physical roads are eligible for incident_confirmation")
+
+    undirected = nx.Graph()
+    for u, v, data in network.G.edges(data=True):
+        length = float(data.get("length_m", 1.0))
+        if undirected.has_edge(int(u), int(v)):
+            undirected[int(u)][int(v)]["length_m"] = min(
+                float(undirected[int(u)][int(v)]["length_m"]), length
+            )
+        else:
+            undirected.add_edge(int(u), int(v), length_m=length)
+    edge_centrality = nx.edge_betweenness_centrality(
+        undirected,
+        normalized=True,
+        weight="length_m",
+    )
+
+    class_importance = {
+        "motorway": 1.00,
+        "motorway_link": 0.95,
+        "trunk": 0.95,
+        "trunk_link": 0.90,
+        "primary": 0.90,
+        "primary_link": 0.85,
+        "secondary": 0.75,
+        "secondary_link": 0.70,
+        "tertiary": 0.60,
+        "tertiary_link": 0.55,
+        "unclassified": 0.45,
+        "residential": 0.40,
+        "living_street": 0.35,
+        "service": 0.25,
+        "pedestrian": 0.20,
+        "cycleway": 0.18,
+        "footway": 0.15,
+        "path": 0.15,
+    }
+    road_class_labels: List[str] = []
+    road_class_weights: List[float] = []
+    centrality_values: List[float] = []
+    for row in pool.itertuples(index=False):
+        u, v = int(row.u_internal_id), int(row.v_internal_id)
+        graph_data = network.G.get_edge_data(u, v) or network.G.get_edge_data(v, u) or {}
+        classes = _road_classes(graph_data.get("road_classes", graph_data.get("road_class_summary")))
+        road_class_labels.append(";".join(sorted(set(classes))) if classes else "unknown")
+        road_class_weights.append(max((class_importance.get(item, 0.30) for item in classes), default=0.30))
+        centrality_values.append(float(edge_centrality.get((u, v), edge_centrality.get((v, u), 0.0))))
+
+    lengths = pd.to_numeric(pool["length_m"], errors="coerce").to_numpy(float)
+    if not np.isfinite(lengths).all() or np.any(lengths <= 0.0):
+        raise ValueError("incident_confirmation roads require positive finite lengths")
+    centrality = np.asarray(centrality_values, dtype=float)
+    length_factor = 0.5 + 0.5 * np.sqrt(lengths / float(lengths.max()))
+    centrality_max = float(centrality.max())
+    centrality_factor = np.ones(len(pool), dtype=float) if centrality_max <= 0.0 else 0.5 + 0.5 * centrality / centrality_max
+    raw_weight = np.asarray(road_class_weights, dtype=float) * length_factor * centrality_factor
+    if not np.isfinite(raw_weight).all() or np.any(raw_weight <= 0.0):
+        raise ValueError("incident_confirmation sampling weights must be positive and finite")
+
+    pool["road_classes"] = road_class_labels
+    pool["road_class_weight"] = road_class_weights
+    pool["length_weight"] = length_factor
+    pool["edge_betweenness_centrality"] = centrality
+    pool["centrality_weight"] = centrality_factor
+    pool["incident_sampling_weight"] = raw_weight
+    pool["incident_sampling_probability"] = raw_weight / raw_weight.sum()
+    return pool
+
+
+def build_congestion_sampling_pool(network: RoadNetwork, eligible_registry: pd.DataFrame) -> pd.DataFrame:
+    """Build congestion weights, using endpoint degree as the hotspot proxy."""
+
+    pool = build_incident_sampling_pool(network, eligible_registry)
+    endpoint_degree = np.asarray([
+        float(network.G.degree[int(row.u_internal_id)] + network.G.degree[int(row.v_internal_id)])
+        for row in pool.itertuples(index=False)
+    ])
+    degree_max = float(endpoint_degree.max())
+    hotspot_score = endpoint_degree / degree_max if degree_max > 0.0 else np.ones(len(pool), dtype=float)
+    raw_weight = (
+        pool["road_class_weight"].to_numpy(float)
+        * pool["length_weight"].to_numpy(float)
+        * pool["centrality_weight"].to_numpy(float)
+        * hotspot_score
+    )
+    if not np.isfinite(raw_weight).all() or np.any(raw_weight <= 0.0):
+        raise ValueError("congestion_anomaly_scan spatial weights must be positive and finite")
+    pool["hotspot_score"] = hotspot_score
+    pool["congestion_spatial_weight_raw"] = raw_weight
+    pool["spatial_weight"] = raw_weight / raw_weight.sum()
+    return pool
+
+
+def _affected_direction_for_road(network: RoadNetwork, row: Any) -> str:
+    u, v = int(row.u_internal_id), int(row.v_internal_id)
+    forward = network.G.has_edge(u, v)
+    reverse = network.G.has_edge(v, u)
+    if forward and reverse:
+        return "both"
+    if forward:
+        return "u_to_v"
+    if reverse:
+        return "v_to_u"
+    raise ValueError(f"Inspection segment {row.edge_id!r} has no traversable direction")
+
+
+def validate_periodic_patrol_schedule(
+    tasks: List[Task],
+    *,
+    selected_segment_count: int,
+    batch_size: int,
+    revisit_interval_s: float,
+    cycle_count: int,
+    deadline_s: float,
+) -> Dict[str, Any]:
+    """Validate and summarize one fixed-group periodic patrol schedule."""
+
+    periodic = [task for task in tasks if bool(task.metadata.get("periodic_task", False))]
+    group_count = int(math.ceil(int(selected_segment_count) / int(batch_size)))
+    phase_interval_s = float(revisit_interval_s) / float(group_count)
+    segment_ids = sorted({str(task.metadata["inspection_segment_id"]) for task in periodic})
+    physical_keys = sorted({str(task.metadata["physical_road_key"]) for task in periodic})
+    errors: List[str] = []
+
+    expected_task_count = int(selected_segment_count) * int(cycle_count)
+    if len(periodic) != expected_task_count:
+        errors.append(f"expected {expected_task_count} periodic tasks, got {len(periodic)}")
+    if len(segment_ids) != int(selected_segment_count):
+        errors.append(f"expected {selected_segment_count} inspection segments, got {len(segment_ids)}")
+    if len(physical_keys) != int(selected_segment_count):
+        errors.append("selected inspection segments are not unique physical roads")
+
+    group_members: Dict[int, set[str]] = {}
+    segment_groups: Dict[str, set[int]] = {}
+    releases_by_segment: Dict[str, List[float]] = {}
+    tasks_by_release: Dict[float, List[Task]] = {}
+    for task in periodic:
+        metadata = task.metadata
+        segment = str(metadata["inspection_segment_id"])
+        group_number = int(metadata["periodic_group_number"])
+        group_members.setdefault(group_number, set()).add(segment)
+        segment_groups.setdefault(segment, set()).add(group_number)
+        releases_by_segment.setdefault(segment, []).append(float(task.release_time))
+        tasks_by_release.setdefault(float(task.release_time), []).append(task)
+        if not math.isclose(float(task.deadline), float(task.release_time) + float(deadline_s), abs_tol=1e-9):
+            errors.append(f"deadline mismatch for task {task.id}")
+
+    if sorted(group_members) != list(range(1, group_count + 1)):
+        errors.append(f"expected group numbers 1..{group_count}, got {sorted(group_members)}")
+    expected_group_sizes = [
+        min(int(batch_size), int(selected_segment_count) - index * int(batch_size))
+        for index in range(group_count)
+    ]
+    actual_group_sizes = [len(group_members.get(index + 1, set())) for index in range(group_count)]
+    if actual_group_sizes != expected_group_sizes:
+        errors.append(f"expected group sizes {expected_group_sizes}, got {actual_group_sizes}")
+    if any(len(groups) != 1 for groups in segment_groups.values()):
+        errors.append("a segment changed periodic group across cycles")
+
+    for segment, releases in releases_by_segment.items():
+        ordered = sorted(releases)
+        if len(ordered) != int(cycle_count):
+            errors.append(f"segment {segment} expected {cycle_count} releases, got {len(ordered)}")
+        if any(
+            not math.isclose(right - left, float(revisit_interval_s), abs_tol=1e-9)
+            for left, right in zip(ordered, ordered[1:])
+        ):
+            errors.append(f"segment {segment} revisit interval is not {revisit_interval_s}")
+
+    ordered_batch_releases = sorted(tasks_by_release)
+    expected_batch_count = group_count * int(cycle_count)
+    if len(ordered_batch_releases) != expected_batch_count:
+        errors.append(f"expected {expected_batch_count} release batches, got {len(ordered_batch_releases)}")
+    if any(
+        not math.isclose(right - left, phase_interval_s, abs_tol=1e-9)
+        for left, right in zip(ordered_batch_releases, ordered_batch_releases[1:])
+    ):
+        errors.append(f"adjacent batch interval is not {phase_interval_s}")
+    if any(len(batch) != expected_group_sizes[index % group_count] for index, batch in enumerate(
+        tasks_by_release[release] for release in ordered_batch_releases
+    )):
+        errors.append("one or more release batches have the wrong task count")
+
+    if errors:
+        raise ValueError("Invalid periodic patrol schedule: " + "; ".join(errors))
+    return {
+        "selected_segment_count": int(selected_segment_count),
+        "unique_physical_road_count": len(physical_keys),
+        "batch_size": int(batch_size),
+        "group_count": group_count,
+        "group_sizes": actual_group_sizes,
+        "phase_interval_s": phase_interval_s,
+        "revisit_interval_s": float(revisit_interval_s),
+        "cycle_count": int(cycle_count),
+        "task_count": len(periodic),
+        "first_release_time_s": min(ordered_batch_releases),
+        "last_release_time_s": max(ordered_batch_releases),
+        "last_deadline_time_s": max(float(task.deadline) for task in periodic),
+    }
+
+
 def build_direct_edge_task_stream(
     network: RoadNetwork,
     registry_path: str,
@@ -140,8 +431,9 @@ def build_direct_edge_task_stream(
     generation_mode = str(task_cfg.get("task_generation_mode", "legacy_fixed"))
     selection = dict(task_cfg.get("periodic_patrol", task_cfg.get("routine_patrol", {})) or {})
     mode = str(selection.get("selection_mode", "seeded_sample"))
+    phased_periodic = "selected_segment_count" in selection
     dynamic_periodic = str(selection.get("release_mode", selection.get("task_generation_mode", ""))).lower() in {"periodic_dynamic", "dynamic_periodic"} or mode in {"least_recently_inspected", "periodic_dynamic"}
-    if dynamic_periodic:
+    if phased_periodic or dynamic_periodic:
         selected_ids = []
     elif mode in {"fixed_edge_set", "fixed_segments"}:
         selected_ids = [str(value) for value in selection.get("inspection_segment_ids", selection.get("edge_ids", []))]
@@ -222,6 +514,7 @@ def build_direct_edge_task_stream(
         cycle_index: Optional[int] = None,
         affected_direction: Optional[str] = None,
         event_id: Optional[str] = None,
+        extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         nonlocal next_id
         instance_id = f"{typ}__{row.edge_id}__{label}"
@@ -259,6 +552,8 @@ def build_direct_edge_task_stream(
                 periodic_expired_count=0,
                 current_cycle_status="unreleased",
             )
+        if extra_metadata:
+            metadata.update(extra_metadata)
         tasks.append(
             Task(
                 id=next_id,
@@ -279,7 +574,78 @@ def build_direct_edge_task_stream(
     routine_type = str(selection.get("task_type", "routine"))
     deadline_window = float(selection.get("deadline_window_s", selection.get("deadline_s", selection.get("service_window_s", interval))))
     routine_service = None if str(service_model.get("mode", "legacy_fixed")) == "segment_length_based" else float(selection.get("service_duration_s", 30.0))
-    if dynamic_periodic:
+    if phased_periodic:
+        selected_segment_count = int(selection["selected_segment_count"])
+        batch_size = int(selection.get("batch_size", 1))
+        revisit_interval_s = float(selection.get("revisit_interval_s", 0.0))
+        cycle_count = int(selection.get("cycle_count", 1))
+        if selected_segment_count <= 0 or batch_size <= 0 or cycle_count <= 0 or revisit_interval_s <= 0.0:
+            raise ValueError("periodic_patrol counts, batch_size, cycle_count and revisit_interval_s must be positive")
+
+        eligible = eligible.drop_duplicates(subset=["edge_id"], keep="first").reset_index(drop=True)
+        eligible["physical_road_key"] = eligible.apply(
+            lambda row: "|".join(sorted((str(row["u_external_id"]), str(row["v_external_id"])))),
+            axis=1,
+        )
+        eligible = eligible.drop_duplicates(subset=["physical_road_key"], keep="first").reset_index(drop=True)
+        if selected_segment_count > len(eligible):
+            raise ValueError(
+                f"periodic_patrol requests {selected_segment_count} unique physical roads, "
+                f"but only {len(eligible)} are eligible"
+            )
+
+        base_seed = int(selection.get("selection_seed", edge_selection.get("fixed_seed", seed)))
+        routine_rng = np.random.default_rng(np.random.SeedSequence([base_seed, int(seed), 0x5054]))
+        selected_positions = routine_rng.choice(len(eligible), size=selected_segment_count, replace=False)
+        selected = eligible.iloc[selected_positions].reset_index(drop=True)
+        group_count = int(math.ceil(selected_segment_count / batch_size))
+        phase_interval_s = revisit_interval_s / float(group_count)
+        groups = [selected.iloc[start : start + batch_size] for start in range(0, selected_segment_count, batch_size)]
+        deadline_window = float(selection.get("deadline_s", revisit_interval_s))
+
+        final_release = release + (cycle_count - 1) * revisit_interval_s + (group_count - 1) * phase_interval_s
+        if final_release >= float(release_horizon_s):
+            raise ValueError(
+                f"periodic_patrol final release {final_release} must be before "
+                f"task_release_horizon_s={release_horizon_s}"
+            )
+
+        periodic_start = len(tasks)
+        for cycle_index in range(cycle_count):
+            for group_index, group in enumerate(groups):
+                group_number = group_index + 1
+                group_release = release + cycle_index * revisit_interval_s + group_index * phase_interval_s
+                for row in group.itertuples(index=False):
+                    append_instance(
+                        row,
+                        routine_type,
+                        group_release,
+                        deadline_window,
+                        float(selection.get("priority", 2.0)),
+                        routine_service,
+                        f"cycle_{cycle_index:02d}_group_{group_number:02d}",
+                        cycle_index=cycle_index,
+                        extra_metadata={
+                            "periodic_group_number": group_number,
+                            "periodic_group_count": group_count,
+                            "periodic_batch_size": batch_size,
+                            "phase_interval_s": phase_interval_s,
+                            "revisit_interval_s": revisit_interval_s,
+                            "periodic_cycle_count": cycle_count,
+                            "selected_segment_count": selected_segment_count,
+                            "physical_road_key": str(row.physical_road_key),
+                            "registry_path": str(registry_path),
+                        },
+                    )
+        validate_periodic_patrol_schedule(
+            tasks[periodic_start:],
+            selected_segment_count=selected_segment_count,
+            batch_size=batch_size,
+            revisit_interval_s=revisit_interval_s,
+            cycle_count=cycle_count,
+            deadline_s=deadline_window,
+        )
+    elif dynamic_periodic:
         base_seed = int(selection.get("base_seed", selection.get("selection_seed", seed)))
         routine_rng = np.random.default_rng(np.random.SeedSequence([base_seed, int(seed), 0x5254]))
         eligible = eligible.drop_duplicates(subset=["edge_id"], keep="first").reset_index(drop=True)
@@ -314,7 +680,7 @@ def build_direct_edge_task_stream(
     defaults = {
         "incident": (420.0, 10.0, 45.0),
         "congestion": (720.0, 6.0, 60.0),
-        "incident_confirmation": (300.0, 10.0, 60.0),
+        "incident_confirmation": (420.0, 10.0, 60.0),
         "congestion_anomaly_scan": (600.0, 6.0, 75.0),
         "road_obstruction_inspection": (300.0, 8.0, 35.0),
         "critical_period_patrol": (360.0, 4.0, 40.0),
@@ -334,6 +700,129 @@ def build_direct_edge_task_stream(
         if pool.empty:
             raise ValueError(f"No eligible direct Xinjiekou edge tasks for task type {typ!r}")
         default_deadline, default_priority, default_service = defaults.get(typ, (420.0, 5.0, 30.0))
+        if typ == "congestion_anomaly_scan":
+            process = str(spec.get("process", "fixed_count_piecewise_random")).lower()
+            if process != "fixed_count_piecewise_random":
+                raise ValueError(
+                    "congestion_anomaly_scan supports only process='fixed_count_piecewise_random'; "
+                    f"got {process!r}"
+                )
+            total_count = int(spec.get("total_count", 0))
+            time_segments = list(spec.get("time_segments", []) or [])
+            releases = congestion_anomaly_release_times(
+                time_segments=time_segments,
+                total_count=total_count,
+                release_horizon_s=release_horizon_s,
+                seed=seed,
+            )
+            congestion_pool = build_congestion_sampling_pool(network, pool)
+            location_rng = np.random.default_rng(np.random.SeedSequence([int(seed), 0x53504154]))
+            scenario_id = str(network.cfg.get("experiment", {}).get("scenario_name", "unknown"))
+            deadline_s = float(spec.get("deadline_s", default_deadline))
+            priority = float(spec.get("priority", default_priority))
+            active_until_by_segment: Dict[str, float] = {}
+            for event_index, event_release in enumerate(releases):
+                available = congestion_pool[
+                    congestion_pool["edge_id"].map(
+                        lambda edge_id: active_until_by_segment.get(str(edge_id), -math.inf) <= event_release
+                    )
+                ]
+                exclusion_fallback = available.empty
+                candidates = congestion_pool if exclusion_fallback else available
+                probabilities = candidates["spatial_weight"].to_numpy(dtype=float, copy=True)
+                probabilities /= probabilities.sum()
+                row = candidates.iloc[int(location_rng.choice(len(candidates), p=probabilities))]
+                segment_id = str(row.edge_id)
+                active_until_by_segment[segment_id] = float(event_release + deadline_s)
+                road_length_m = float(row.length_m)
+                service_time_s = float(np.clip(road_length_m / 5.0 + 30.0, 45.0, 120.0))
+                direction = _affected_direction_for_road(network, row)
+                append_instance(
+                    row,
+                    typ,
+                    event_release,
+                    deadline_s,
+                    priority,
+                    service_time_s,
+                    f"event_{event_index:04d}",
+                    affected_direction=direction,
+                    event_id=f"{typ}_{event_index:04d}",
+                    extra_metadata={
+                        "scenario_id": scenario_id,
+                        "release_time_s": float(event_release),
+                        "deadline_time_s": float(event_release + deadline_s),
+                        "priority": priority,
+                        "road_length_m": road_length_m,
+                        "service_time_s": service_time_s,
+                        "spatial_weight": float(row.spatial_weight),
+                        "generation_seed": int(seed),
+                        "generation_process": process,
+                        "physical_road_key": str(row.physical_road_key),
+                        "road_classes": str(row.road_classes),
+                        "road_class_weight": float(row.road_class_weight),
+                        "length_weight": float(row.length_weight),
+                        "edge_betweenness_centrality": float(row.edge_betweenness_centrality),
+                        "centrality_weight": float(row.centrality_weight),
+                        "hotspot_score": float(row.hotspot_score),
+                        "active_road_exclusion_fallback": bool(exclusion_fallback),
+                        "registry_path": str(registry_path),
+                    },
+                )
+            continue
+        if typ == "incident_confirmation":
+            process = str(spec.get("process", "homogeneous_poisson")).lower()
+            if process != "homogeneous_poisson":
+                raise ValueError(
+                    "incident_confirmation supports only process='homogeneous_poisson'; "
+                    f"got {process!r}"
+                )
+            arrival_rate_per_hour = float(spec.get("arrival_rate_per_hour", 0.0))
+            releases = incident_confirmation_release_times(
+                arrival_rate_per_hour=arrival_rate_per_hour,
+                release_horizon_s=release_horizon_s,
+                seed=seed,
+            )
+            incident_pool = build_incident_sampling_pool(network, pool)
+            location_rng = np.random.default_rng(np.random.SeedSequence([int(seed), 0x4C4F4341]))
+            direction_rng = np.random.default_rng(np.random.SeedSequence([int(seed), 0x44495245]))
+            probabilities = incident_pool["incident_sampling_probability"].to_numpy(float)
+            scenario_id = str(network.cfg.get("experiment", {}).get("scenario_name", "unknown"))
+            deadline_s = float(spec.get("deadline_s", default_deadline))
+            for event_index, event_release in enumerate(releases):
+                row = incident_pool.iloc[int(location_rng.choice(len(incident_pool), p=probabilities))]
+                direction = "u_to_v" if int(direction_rng.integers(0, 2)) == 0 else "v_to_u"
+                road_length_m = float(row.length_m)
+                service_time_s = float(np.clip(road_length_m / 3.0 + 45.0, 60.0, 150.0))
+                append_instance(
+                    row,
+                    typ,
+                    event_release,
+                    deadline_s,
+                    float(spec.get("priority", default_priority)),
+                    service_time_s,
+                    f"event_{event_index:04d}",
+                    affected_direction=direction,
+                    event_id=f"{typ}_{event_index:04d}",
+                    extra_metadata={
+                        "scenario_id": scenario_id,
+                        "release_time_s": float(event_release),
+                        "deadline_time_s": float(event_release + deadline_s),
+                        "road_length_m": road_length_m,
+                        "service_time_s": service_time_s,
+                        "arrival_rate_per_hour": arrival_rate_per_hour,
+                        "generation_seed": int(seed),
+                        "arrival_process": process,
+                        "physical_road_key": str(row.physical_road_key),
+                        "road_classes": str(row.road_classes),
+                        "road_class_weight": float(row.road_class_weight),
+                        "length_weight": float(row.length_weight),
+                        "edge_betweenness_centrality": float(row.edge_betweenness_centrality),
+                        "centrality_weight": float(row.centrality_weight),
+                        "incident_sampling_probability": float(row.incident_sampling_probability),
+                        "registry_path": str(registry_path),
+                    },
+                )
+            continue
         release_mode = str(spec.get("arrival_process", spec.get("release_mode", "poisson"))).lower()
         if release_mode == "poisson":
             rate = float(spec.get("rate_per_hour", 0.0))

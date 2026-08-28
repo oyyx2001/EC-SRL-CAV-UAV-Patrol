@@ -11,6 +11,6 @@ regions:
     launch_nodes_file: launch_recovery_nodes.geojson
     intersection_nodes_file: intersection_launch_nodes.geojson
     supplementary_nodes_file: supplementary_launch_nodes.geojson
-    major_road_graph_file: major_road_graph.graphml
-    compressed_road_edges_file: compressed_major_road_edges.geojson
-    buildings_file: buildings_local.geojson
+    major_road_graph_file: road_network.graphml
+    compressed_road_edges_file: road_edges.geojson
+    buildings_file: buildings.geojson

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 import math
 import time
@@ -17,7 +18,7 @@ from dynamic_patrol_marl.env.events import Event, EventQueue
 from dynamic_patrol_marl.planner.sortie_generator import Sortie
 from dynamic_patrol_marl.planner.joint_plan import JointPlan, JointPlanCache
 from dynamic_patrol_marl.rl.reward_ledger import RewardComponents, RewardLedger
-from dynamic_patrol_marl.rl.smdp import transition_discount
+from dynamic_patrol_marl.rl.smdp import resolve_discount_settings, transition_discount
 
 
 class SimpleDiscrete:
@@ -87,14 +88,12 @@ class DynamicPatrolEnv(BaseEnv):
         self.time_mode = str(time_cfg.get("mode", cfg.get("time_mode", "fixed_interval"))).lower()
         self.event_cfg = dict(cfg.get("event_driven", {}))
         self.smdp_cfg = dict(cfg.get("smdp", {}))
-        self.reference_interval_s = float(self.smdp_cfg.get("reference_interval_s", 60.0))
-        self.gamma_reference = float(
-            self.smdp_cfg.get(
-                "gamma_reference",
-                cfg.get("rl", {}).get("hyperparams", {}).get("gamma", 0.99),
-            )
-        )
-        self.discount_mode = str(self.smdp_cfg.get("discount_mode", "continuous_time"))
+        (
+            self.discount_mode,
+            self.gamma_reference,
+            self.reference_interval_s,
+            self.n_step,
+        ) = resolve_discount_settings(cfg)
         self.event_queue: Optional[EventQueue] = None
         self.transition_log: List[Dict[str, Any]] = []
         self.event_timeline: List[Dict[str, Any]] = []
@@ -117,6 +116,20 @@ class DynamicPatrolEnv(BaseEnv):
         self._operation_reward = 0.0
         self._drain_reward = 0.0
         self._censored_task_ids: set[int] = set()
+        # Event-driven diagnostics distinguish physical state changes from
+        # actual calls to the policy.  ``transition_log`` intentionally keeps
+        # the physical sub-transitions for reward auditing, while the public
+        # step API coalesces forced actions into one SMDP transition.
+        self.policy_decision_count = 0
+        self.single_valid_action_count = 0
+        self.multi_valid_action_count = 0
+        self.automatic_action_count = 0
+        self.non_safe_action_count = 0
+        self._valid_action_counts: List[int] = []
+        self._smdp_duration_history: List[float] = []
+        self.policy_trigger_event_counts: Counter[str] = Counter()
+        self.initial_automatic_action_count = 0
+        self.initial_automatic_reward = 0.0
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict] = None):
         if self.seed_scheduler is not None:
@@ -150,11 +163,23 @@ class DynamicPatrolEnv(BaseEnv):
         self._operation_reward = 0.0
         self._drain_reward = 0.0
         self._censored_task_ids = set()
+        self.policy_decision_count = 0
+        self.single_valid_action_count = 0
+        self.multi_valid_action_count = 0
+        self.automatic_action_count = 0
+        self.non_safe_action_count = 0
+        self._valid_action_counts = []
+        self._smdp_duration_history = []
+        self.policy_trigger_event_counts = Counter()
+        self.initial_automatic_action_count = 0
+        self.initial_automatic_reward = 0.0
         if self.time_mode == "event_driven":
             self._initialize_event_queue()
         self.joint_plan_cache = None
         self._ground_action_committed_time = None
         self._prepare_decision_epoch(["INITIAL_DECISION"])
+        if self.time_mode == "event_driven":
+            self._settle_initial_forced_actions()
         obs = self._observation()
         initial_mask = self.action_masks()
         info = {
@@ -212,6 +237,173 @@ class DynamicPatrolEnv(BaseEnv):
         )
         self._decision_epoch_serial += 1
         self.candidates = []
+
+    @staticmethod
+    def _as_step_parts(step_output: Any) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        """Normalize Gymnasium and legacy step signatures for coalescing."""
+
+        if len(step_output) == 5:
+            obs, reward, terminated, truncated, info = step_output
+            return np.asarray(obs, dtype=np.float32), float(reward), bool(terminated), bool(truncated), dict(info)
+        obs, reward, done, info = step_output
+        return np.asarray(obs, dtype=np.float32), float(reward), bool(done), False, dict(info)
+
+    def _format_step_parts(
+        self,
+        obs: np.ndarray,
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+        info: Dict[str, Any],
+    ):
+        if gym is not None:
+            return obs, float(reward), bool(terminated), bool(truncated), info
+        return obs, float(reward), bool(terminated or truncated), info
+
+    @staticmethod
+    def _ordered_unique(values: List[str]) -> List[str]:
+        return list(dict.fromkeys(str(value) for value in values if str(value)))
+
+    def _coalesce_event_steps(
+        self,
+        steps: List[Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]],
+    ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        """Return one time-consistent SMDP transition from atomic event steps.
+
+        Each atomic event step already has its own effective discount.  The
+        accumulated reward therefore uses the product of preceding discounts,
+        and the returned bootstrap discount is the full product.  This is the
+        same composition used by ``NStepSMDPAccumulator`` and works for both
+        fixed-decision and time-aware discount modes.
+        """
+
+        if not steps:
+            raise ValueError("cannot coalesce an empty event-step sequence")
+        first_obs, _first_reward, _first_terminated, _first_truncated, first_info = steps[0]
+        final_obs, _final_reward, terminated, truncated, final_info = steps[-1]
+        accumulated_reward = 0.0
+        raw_physical_reward = 0.0
+        discount_product = 1.0
+        total_delta_t = 0.0
+        processed_events = 0
+        automatic_count = 0
+        trigger_events: List[str] = []
+        ledger_components: Dict[str, float] = {}
+        reward_components: Dict[str, float] = {}
+        reward_audit_components: Dict[str, float] = {}
+        completed_task_ids: set[int] = set()
+        timed_out_task_ids: set[int] = set()
+
+        for _obs, reward, _terminated, _truncated, info in steps:
+            accumulated_reward += discount_product * float(reward)
+            raw_physical_reward += float(reward)
+            total_delta_t += float(info.get("delta_t", 0.0))
+            processed_events += int(info.get("processed_event_count", 0))
+            automatic_count += int(bool(info.get("automatic_action", False)))
+            trigger_events.extend(str(item) for item in info.get("trigger_events", []))
+            for name, value in dict(info.get("reward_ledger_components", {}) or {}).items():
+                ledger_components[name] = ledger_components.get(name, 0.0) + discount_product * float(value)
+            for name, value in dict(info.get("reward_components", {}) or {}).items():
+                reward_components[name] = reward_components.get(name, 0.0) + discount_product * float(value)
+            for name, value in dict(info.get("reward_audit_components", {}) or {}).items():
+                reward_audit_components[name] = reward_audit_components.get(name, 0.0) + discount_product * float(value)
+            completed_task_ids.update(int(item) for item in info.get("completed_task_ids", []) or [])
+            timed_out_task_ids.update(int(item) for item in info.get("timed_out_task_ids", []) or [])
+            discount_product *= float(info["transition_discount"])
+
+        if not math.isclose(
+            accumulated_reward,
+            float(sum(reward_components.values())),
+            rel_tol=0.0,
+            abs_tol=1e-8,
+        ):
+            raise AssertionError(
+                "coalesced reward ledger does not conserve discounted reward: "
+                f"reward={accumulated_reward} components={sum(reward_components.values())}"
+            )
+
+        combined_info = dict(first_info)
+        combined_info.update({
+            "action_mask": np.asarray(final_info["action_mask"], dtype=bool),
+            "time": float(final_info.get("time", 0.0)),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "delta_t": float(total_delta_t),
+            "transition_discount": float(discount_product),
+            "next_decision_time": float(final_info.get("next_decision_time", final_info.get("time", 0.0))),
+            "trigger_events": self._ordered_unique(trigger_events),
+            "processed_event_count": int(processed_events),
+            "stale_event_count": int(final_info.get("stale_event_count", 0)),
+            "duplicate_event_count": int(final_info.get("duplicate_event_count", 0)),
+            "invalid_time_event_count": int(final_info.get("invalid_time_event_count", 0)),
+            "reward_components": reward_components,
+            "reward_ledger_components": ledger_components,
+            "reward_audit_components": reward_audit_components,
+            "valid_action_count": int(np.asarray(final_info["action_mask"], dtype=bool).sum()),
+            "valid_non_wait_action_count": int(np.asarray(final_info["action_mask"], dtype=bool)[1:].sum()),
+            "completed_task_ids": sorted(completed_task_ids),
+            "timed_out_task_ids": sorted(timed_out_task_ids),
+            "automatic_action_count": int(automatic_count),
+            "smdp_subtransition_count": int(len(steps)),
+            "raw_physical_reward": float(raw_physical_reward),
+            "smdp_aggregated_reward": float(accumulated_reward),
+            "reward_conservation_error": float(accumulated_reward - sum(reward_components.values())),
+            "wall_clock_step_time_ms": float(sum(float(item[4].get("wall_clock_step_time_ms", 0.0)) for item in steps)),
+        })
+        return final_obs, float(accumulated_reward), bool(terminated), bool(truncated), combined_info
+
+    def _settle_initial_forced_actions(self) -> None:
+        """Hide deterministic initial states from the policy and replay.
+
+        There is no preceding policy action at reset to which an initial forced
+        interval could be attached.  We still execute it physically and keep it
+        in the raw event/reward audit, but expose the first state with a real
+        choice to the policy.
+        """
+
+        max_steps = int(self.event_cfg.get("max_automatic_advance_steps", 100000))
+        for _ in range(max_steps):
+            if self._episode_done() or int(self.action_masks().sum()) != 1:
+                return
+            parts = self._as_step_parts(self._step_event_driven_once(0, automatic_action=True))
+            self.initial_automatic_action_count += 1
+            self.initial_automatic_reward += float(parts[1])
+        raise RuntimeError("initial forced-action settlement exceeded max_automatic_advance_steps")
+
+    def _step_event_driven(self, action: int):
+        """Execute one policy choice and coalesce any following forced actions."""
+
+        assert self.sim is not None and self.event_queue is not None, "call reset first"
+        source_mask = self.action_masks()
+        is_automatic_source = int(source_mask.sum()) == 1
+        if not is_automatic_source:
+            self.policy_decision_count += 1
+
+        steps: List[Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]] = []
+        current_action = int(np.flatnonzero(source_mask)[0]) if is_automatic_source else int(action)
+        automatic = bool(is_automatic_source)
+        max_steps = int(self.event_cfg.get("max_automatic_advance_steps", 100000))
+        for _ in range(max_steps):
+            parts = self._as_step_parts(
+                self._step_event_driven_once(current_action, automatic_action=automatic)
+            )
+            steps.append(parts)
+            _obs, _reward, terminated, truncated, info = parts
+            if terminated or truncated:
+                break
+            next_mask = np.asarray(info["action_mask"], dtype=bool)
+            if int(next_mask.sum()) >= 2:
+                break
+            if int(next_mask.sum()) != 1:
+                raise RuntimeError("action mask must retain the safe action during automatic advance")
+            current_action = int(np.flatnonzero(next_mask)[0])
+            automatic = True
+        else:
+            raise RuntimeError("forced-action coalescing exceeded max_automatic_advance_steps")
+
+        obs, reward, terminated, truncated, info = self._coalesce_event_steps(steps)
+        self._smdp_duration_history.append(float(info["delta_t"]))
+        return self._format_step_parts(obs, reward, terminated, truncated, info)
 
     def _step_fixed_interval(self, action: int):
         assert self.sim is not None, "call reset first"
@@ -461,6 +653,131 @@ class DynamicPatrolEnv(BaseEnv):
             },
             "queue_length": len(self.sim.recovery_queue),
         }
+
+    def _scheduling_fingerprint(self) -> Tuple[Any, ...]:
+        """Return only state fields that can create a new dispatch choice.
+
+        Flight-segment progress and the current clock are deliberately absent:
+        a UAV climbing or changing between ordinary flight segments is a
+        physical event, not automatically a policy opportunity.  In contrast,
+        released/unassigned work, UAV availability on the CAV, the CAV's
+        decision node/route and recovery assignments are all represented.
+        """
+
+        assert self.sim is not None
+        vehicle = self.sim.vehicle
+        available = tuple(
+            sorted(
+                (
+                    int(task.id),
+                    str(task.status),
+                    str(getattr(task, "executor", "")),
+                )
+                for task in self.sim.task_pool.available_tasks(self.sim.now)
+            )
+        )
+        idle_on_vehicle = tuple(
+            sorted(
+                (
+                    str(drone.id),
+                    int(drone.position),
+                    round(float(drone.battery), 6),
+                )
+                for drone in self.sim.idle_drones_on_vehicle()
+            )
+        )
+        route = (
+            int(vehicle.position),
+            None if vehicle.target_node is None else int(vehicle.target_node),
+            bool(vehicle.at_intersection),
+            tuple(int(node) for node in getattr(vehicle, "path_nodes", []) or []),
+            int(getattr(vehicle, "schedule_version", 0)),
+        )
+        recovery = tuple(
+            sorted(
+                (
+                    str(entry.get("sortie_id", entry.get("drone_id", ""))),
+                    str(entry.get("drone_id", entry.get("uav_id", ""))),
+                    int(entry.get("recovery_node", -1)),
+                )
+                for entry in self.sim.recovery_queue
+            )
+        )
+        return available, idle_on_vehicle, route, recovery
+
+    def _candidate_signature(self) -> Tuple[Any, ...]:
+        """Identify substantive action-set changes without comparing features."""
+
+        if self.decision_mode == "joint_plan":
+            cache = self.joint_plan_cache
+            if cache is None:
+                return tuple()
+            rows = []
+            for index, plan in enumerate(cache.plan_slots):
+                if plan is None:
+                    rows.append((index, False, "padding"))
+                    continue
+                ground = getattr(plan, "ground_candidate", None)
+                sortie = getattr(plan, "sortie", None)
+                rows.append(
+                    (
+                        int(index),
+                        bool(cache.action_mask[index]),
+                        str(getattr(plan, "plan_type", "")),
+                        str(getattr(ground, "action_type", "")),
+                        None if sortie is None else str(getattr(sortie, "drone_id", "")),
+                        tuple(int(task_id) for task_id in (getattr(sortie, "task_ids", []) or [])),
+                        None if sortie is None else int(getattr(sortie, "recovery_node", -1)),
+                    )
+                )
+            return tuple(rows)
+        return tuple(
+            (
+                bool(getattr(candidate, "feasible", False)),
+                str(getattr(candidate, "drone_id", "")),
+                tuple(int(task_id) for task_id in (getattr(candidate, "task_ids", []) or [])),
+                int(getattr(candidate, "recovery_node", -1)),
+            )
+            for candidate in self.candidates
+        )
+
+    @staticmethod
+    def _decision_trigger_sources(
+        batch_types: List[str],
+        before: Tuple[Any, ...],
+        after: Tuple[Any, ...],
+        candidate_changed: bool,
+    ) -> List[str]:
+        """Attribute a decision to the state change that created it.
+
+        Several physical events can share a timestamp.  Counting every event
+        in such a batch would incorrectly make, for example,
+        ``UAV_CLIMB_COMPLETE`` look like a policy trigger when a simultaneous
+        CAV wait completion actually created the scheduling opportunity.
+        """
+
+        sources: List[str] = []
+        event_set = {str(event_type) for event_type in batch_types}
+        if before[0] != after[0]:
+            sources.extend(sorted(event_set & {"TASK_RELEASE", "TASK_TIMEOUT"}) or ["TASK_POOL_CHANGED"])
+        if before[1] != after[1]:
+            sources.extend(
+                sorted(event_set & {"UAV_RECOVERED", "CAV_RECOVERY_COMPLETE", "UAV_RECOVERY_ARRIVAL"})
+                or ["UAV_AVAILABILITY_CHANGED"]
+            )
+        if before[2] != after[2]:
+            sources.extend(
+                sorted(event_type for event_type in event_set if event_type.startswith("CAV_"))
+                or ["CAV_ROUTE_OR_NODE_CHANGED"]
+            )
+        if before[3] != after[3]:
+            sources.extend(
+                sorted(event_set & {"UAV_RECOVERED", "CAV_RECOVERY_COMPLETE", "UAV_RECOVERY_ARRIVAL"})
+                or ["RECOVERY_PLAN_CHANGED"]
+            )
+        if candidate_changed:
+            sources.append("CANDIDATE_SET_CHANGED")
+        return list(dict.fromkeys(sources or ["SCHEDULING_STATE_CHANGED"]))
 
     def _reward_snapshot(self) -> Dict[str, Any]:
         assert self.sim is not None
@@ -715,7 +1032,11 @@ class DynamicPatrolEnv(BaseEnv):
             float(after.get("coordination_failure_count", 0.0)) - float(before.get("coordination_failure_count", 0.0)),
         )
 
-        illegal_reward = -float(weights.get("coordination_failure", 15.0)) if illegal else 0.0
+        # Keep invalid-action cost independent from an actual coordination
+        # failure.  Reward-freezing experiments vary both terms explicitly;
+        # fall back to the historical shared value for existing configurations.
+        illegal_weight = float(weights.get("illegal_action", weights.get("coordination_failure", 15.0)))
+        illegal_reward = -illegal_weight if illegal else 0.0
         terminal_undone_reward = self._terminal_undone_penalty() if terminated else 0.0
 
         ledger_components = RewardComponents(
@@ -753,7 +1074,15 @@ class DynamicPatrolEnv(BaseEnv):
             "terminal_undone_cost": float(-ledger_components.terminal_undone_cost),
             "illegal_action_cost": float(-ledger_components.illegal_action_cost),
         }
-        self.reward_ledger.assert_conserved(ledger_components, sum(components.values()))
+        component_total = float(sum(components.values()))
+        if abs(float(ledger_components.final_reward) - component_total) >= 1e-8:
+            raise AssertionError(
+                "stage5 reward components do not conserve transition reward: "
+                f"reward={ledger_components.final_reward} "
+                f"components={component_total} "
+                f"diff={ledger_components.final_reward - component_total}"
+            )
+        self.reward_ledger.assert_conserved(ledger_components, component_total)
         self._last_reward_ledger_components = ledger_components.to_dict()
         self._last_reward_ledger_components.update(
             {
@@ -820,19 +1149,31 @@ class DynamicPatrolEnv(BaseEnv):
         components["reward_conservation_error"] = conservation_error
         return components
 
-    def _step_event_driven(self, action: int):
+    def _step_event_driven_once(self, action: int, *, automatic_action: bool = False):
         assert self.sim is not None and self.event_queue is not None, "call reset first"
         wall_start = time.perf_counter()
         decision_time = float(self.sim.now)
         source_mask = self.action_masks()
         valid_action_count = int(source_mask.sum())
         valid_non_wait_count = int(source_mask[1:].sum())
+        self._valid_action_counts.append(valid_action_count)
+        if valid_action_count == 1:
+            self.single_valid_action_count += 1
+        else:
+            self.multi_valid_action_count += 1
+        if automatic_action:
+            self.automatic_action_count += 1
         forced_wait = bool(int(action) == 0 and valid_non_wait_count == 0)
         if forced_wait:
             self.forced_wait_decisions += 1
         if valid_non_wait_count > 0:
             self.meaningful_decisions += 1
 
+        # Capture the transition baseline before a joint plan is committed.
+        # Joint-plan commit mutates the CAV route and appends route events; a
+        # post-commit baseline would place the same event in before and after,
+        # forcing its transition-local reward delta to zero.
+        before = self._reward_snapshot()
         illegal = bool(action < 0 or action >= self.max_actions or not bool(source_mask[action]))
         selected: Optional[Sortie] = None
         selected_plan: Optional[JointPlan] = None
@@ -856,10 +1197,11 @@ class DynamicPatrolEnv(BaseEnv):
             candidate_index = int(action) - 1
             if candidate_index < len(self.candidates):
                 selected = self.candidates[candidate_index]
+        if not illegal and int(action) != 0:
+            self.non_safe_action_count += 1
         selected_sortie_id = ""
         if selected is not None:
             selected_sortie_id = self.sim.recovery_scheduler.sortie_id(selected)
-        before = self._reward_snapshot()
         wait_penalty = self._wait_penalty(action)
         launched = int(selected is not None) if self.decision_mode == "joint_plan" and not illegal else self.sim.dispatch_sorties(selected)
         trigger_events: List[str] = ["UAV_LAUNCH"] if launched > 0 else []
@@ -911,6 +1253,8 @@ class DynamicPatrolEnv(BaseEnv):
                 for event in batch:
                     self._dynamic_event_signatures.pop(event.entity_id, None)
                 state_before = self._state_summary()
+                scheduling_before = self._scheduling_fingerprint()
+                candidate_before = self._candidate_signature()
                 event_log_start = len(self.sim.event_log)
                 if next_time > self.sim.now + self.event_queue.time_tolerance:
                     self.sim.step(next_time - self.sim.now)
@@ -934,19 +1278,46 @@ class DynamicPatrolEnv(BaseEnv):
                         if mapped is not None:
                             batch_types.append(mapped)
                 batch_types = list(dict.fromkeys(batch_types))
-                self._pending_ground_trigger_events.extend(batch_types)
-                if any(
-                    event_type in {"UAV_RECOVERED", "CAV_RECOVERY_COMPLETE"}
-                    for event_type in batch_types
-                ):
-                    self._pending_ground_trigger_events.append("RECOVERY_QUEUE_UPDATED")
                 state_after = self._state_summary()
+                scheduling_after = self._scheduling_fingerprint()
+                scheduling_changed = scheduling_before != scheduling_after
                 if self._ground_action_committed_time is not None and self.sim.now > self._ground_action_committed_time + 1e-9:
                     self._ground_action_committed_time = None
-                self._prepare_decision_epoch(batch_types)
-                next_mask_for_decision = self.action_masks()
-                decision_triggered = bool(next_mask_for_decision[1:].any()) and not self._episode_done()
-                if not decision_triggered and not self._episode_done() and self.decision_mode != "joint_plan":
+
+                # A batch may contain many physical events at the same
+                # timestamp.  Rebuild candidates only after the full batch and
+                # only when its processed state has changed dispatch-relevant
+                # fields.  This is what suppresses spurious decisions at
+                # climb/ordinary flight segment boundaries.
+                candidate_changed = False
+                if scheduling_changed:
+                    self._pending_ground_trigger_events.extend(batch_types)
+                    if any(
+                        event_type in {"UAV_RECOVERED", "CAV_RECOVERY_COMPLETE"}
+                        for event_type in batch_types
+                    ):
+                        self._pending_ground_trigger_events.append("RECOVERY_QUEUE_UPDATED")
+                    self._prepare_decision_epoch(batch_types)
+                    next_mask_for_decision = self.action_masks()
+                    candidate_changed = candidate_before != self._candidate_signature()
+                else:
+                    next_mask_for_decision = self.action_masks()
+                decision_triggered = bool(
+                    scheduling_changed
+                    and (candidate_changed or scheduling_before != scheduling_after)
+                    and bool(next_mask_for_decision[1:].any())
+                    and not self._episode_done()
+                )
+                if decision_triggered:
+                    self.policy_trigger_event_counts.update(
+                        self._decision_trigger_sources(
+                            batch_types,
+                            scheduling_before,
+                            scheduling_after,
+                            candidate_changed,
+                        )
+                    )
+                if scheduling_changed and not decision_triggered and not self._episode_done() and self.decision_mode != "joint_plan":
                     next_ground_event = self.event_queue.peek_time(self.sim.now, self._event_version)
                     automatic_ground_action = self.sim.ground_controller.decide(
                         list(dict.fromkeys(self._pending_ground_trigger_events)),
@@ -958,6 +1329,15 @@ class DynamicPatrolEnv(BaseEnv):
                     self._prepare_decision_epoch(self._pending_ground_trigger_events)
                     next_mask_for_decision = self.action_masks()
                     decision_triggered = bool(next_mask_for_decision[1:].any()) and not self._episode_done()
+                    if decision_triggered:
+                        self.policy_trigger_event_counts.update(
+                            self._decision_trigger_sources(
+                                batch_types,
+                                scheduling_before,
+                                scheduling_after,
+                                True,
+                            )
+                        )
                 for event_type in batch_types or ["STATE_ADVANCE"]:
                     self.event_timeline.append(
                         {
@@ -978,7 +1358,9 @@ class DynamicPatrolEnv(BaseEnv):
                     break
 
         terminated, truncated = self._episode_status()
-        delta_t = max(0.0, float(self.sim.now) - decision_time)
+        # Both values are simulator seconds.  Do not clamp: a backwards clock
+        # must fail in transition_discount instead of silently becoming dt=0.
+        delta_t = float(self.sim.now) - decision_time
         discount = transition_discount(
             self.gamma_reference,
             delta_t,
@@ -1033,6 +1415,7 @@ class DynamicPatrolEnv(BaseEnv):
             "valid_action_count": int(next_mask.sum()),
             "valid_non_wait_action_count": int(next_mask[1:].sum()),
             "forced_wait": forced_wait,
+            "automatic_action": bool(automatic_action),
             "instantaneous_dispatch": instantaneous_dispatch,
             "instantaneous_decision_count": int(self._instantaneous_count),
             "selected_sortie_id": selected_sortie_id,
@@ -1065,6 +1448,7 @@ class DynamicPatrolEnv(BaseEnv):
             "valid_action_count": valid_action_count,
             "valid_non_wait_action_count": valid_non_wait_count,
             "forced_wait": forced_wait,
+            "automatic_action": bool(automatic_action),
             "instantaneous_dispatch": instantaneous_dispatch,
             "reward_total": reward,
             "reward_completion": reward_components.get("completion", reward_components.get("completion_reward", 0.0)),
@@ -1088,6 +1472,11 @@ class DynamicPatrolEnv(BaseEnv):
             "stage5_cost_recovery_queue": self._last_reward_ledger_components.get("recovery_queue_cost", 0.0),
             "stage5_cost_route_change": self._last_reward_ledger_components.get("route_change_cost", 0.0),
             "stage5_cost_route_reverse": self._last_reward_ledger_components.get("route_reverse_cost", 0.0),
+            "raw_route_change_delta": self._last_reward_ledger_components.get("raw_route_change_delta", 0.0),
+            "raw_route_reverse_delta": self._last_reward_ledger_components.get("raw_route_reverse_delta", 0.0),
+            "stage5_cost_coordination_failure": self._last_reward_ledger_components.get("coordination_failure_cost", 0.0),
+            "stage5_cost_terminal_undone": self._last_reward_ledger_components.get("terminal_undone_cost", 0.0),
+            "stage5_cost_illegal_action": self._last_reward_ledger_components.get("illegal_action_cost", 0.0),
             "queue_length": len(self.sim.recovery_queue),
             "recovery_rule": self.sim.recovery_rule,
             "stale_event_count": int(self.event_queue.stale_event_count),
@@ -1105,6 +1494,8 @@ class DynamicPatrolEnv(BaseEnv):
         assert self.sim is not None
         delta = np.asarray(self._delta_t_history, dtype=np.float64)
         discounts = np.asarray(self._discount_history, dtype=np.float64)
+        valid_counts = np.asarray(self._valid_action_counts, dtype=np.float64)
+        smdp_durations = np.asarray(self._smdp_duration_history, dtype=np.float64)
         metrics = self.sim.metrics("rl_env").to_dict()
         decisions = len(self.transition_log)
         self._capture_cutoff_state()
@@ -1119,10 +1510,58 @@ class DynamicPatrolEnv(BaseEnv):
             "backlog_rate_at_cutoff": 0.0,
         }
         total_reward = float(sum(row["reward_total"] for row in self.transition_log))
+        component_sum = lambda key: float(sum(float(row.get(key, 0.0)) for row in self.transition_log))
+        reward_components = {
+            "completion_reward": component_sum("stage5_reward_completion"),
+            "priority_reward": component_sum("stage5_reward_priority"),
+            "timeout_penalty": -component_sum("stage5_cost_timeout"),
+            "weighted_aoi_penalty": -component_sum("stage5_cost_aoi"),
+            "flight_energy_penalty": -component_sum("stage5_cost_flight_energy"),
+            "hover_energy_penalty": -component_sum("stage5_cost_hover_energy"),
+            "uav_return_distance_penalty": -component_sum("stage5_cost_return_distance"),
+            "cav_distance_penalty": -component_sum("stage5_cost_cav_distance"),
+            "recovery_wait_penalty": -component_sum("stage5_cost_recovery_wait"),
+            "queue_occupancy_penalty": -component_sum("stage5_cost_recovery_queue"),
+            "route_change_penalty": -component_sum("stage5_cost_route_change"),
+            "route_reversal_penalty": -component_sum("stage5_cost_route_reverse"),
+            "failure_penalty": -(
+                component_sum("stage5_cost_coordination_failure")
+                + component_sum("stage5_cost_terminal_undone")
+                + component_sum("stage5_cost_illegal_action")
+            ),
+            "episode_total_reward": total_reward,
+        }
+        decomposed_total = float(
+            sum(
+                value
+                for name, value in reward_components.items()
+                if name != "episode_total_reward"
+            )
+        )
+        reward_conservation_error = total_reward - decomposed_total
+        if abs(reward_conservation_error) >= 1e-8:
+            raise AssertionError(
+                "episode reward components do not conserve total reward: "
+                f"reward={total_reward} components={decomposed_total} "
+                f"diff={reward_conservation_error}"
+            )
+        joint_generator = getattr(self.sim, "joint_plan_generator", None)
+        reliability_metrics = {
+            "illegal_actions": int(getattr(self.sim, "illegal_actions", 0)),
+            "commit_failure_count": int(getattr(joint_generator, "commit_failures", 0)),
+            "path_planning_failure_count": int(
+                metrics.get("path_planning_failure_count", 0)
+            ),
+            "infeasible_recoveries": int(getattr(self.sim, "infeasible_recoveries", 0)),
+            "queue_occupancy_time_s": float(
+                getattr(self.sim, "recovery_queue_occupancy_integral_s", 0.0)
+            ),
+        }
         terminated, truncated = self._episode_status()
         return {
             **metrics,
             "episode_return": total_reward,
+            "physical_episode_reward": total_reward,
             "simulated_time": float(self.sim.now),
             "task_release_horizon_s": float(self.sim.task_release_horizon),
             "episode_end_time_s": float(self.sim.now),
@@ -1160,10 +1599,26 @@ class DynamicPatrolEnv(BaseEnv):
             "operation_reward": float(self._operation_reward),
             "drain_reward": float(self._drain_reward),
             "episode_reward_total": total_reward,
+            **reward_components,
+            "reward_conservation_error": float(reward_conservation_error),
+            **reliability_metrics,
             "reward_per_released_task": float(total_reward / released) if released else 0.0,
             "reward_per_operation_hour": float(total_reward / max(float(self.sim.task_release_horizon) / 3600.0, 1e-12)),
             "decisions_per_episode": int(decisions),
             "system_events_per_episode": int(self.system_events_processed),
+            "physical_event_count": int(self.system_events_processed),
+            "atomic_event_transition_count": int(decisions),
+            "policy_decision_count": int(self.policy_decision_count),
+            "single_valid_action_count": int(self.single_valid_action_count),
+            "multi_valid_action_count": int(self.multi_valid_action_count),
+            "average_valid_action_count": float(valid_counts.mean()) if valid_counts.size else 0.0,
+            "automatic_action_count": int(self.automatic_action_count),
+            "initial_automatic_action_count": int(self.initial_automatic_action_count),
+            "initial_automatic_reward": float(self.initial_automatic_reward),
+            "average_smdp_duration": float(smdp_durations.mean()) if smdp_durations.size else 0.0,
+            "maximum_smdp_duration": float(smdp_durations.max()) if smdp_durations.size else 0.0,
+            "non_safe_action_count": int(self.non_safe_action_count),
+            "policy_trigger_event_counts": dict(sorted(self.policy_trigger_event_counts.items())),
             "meaningful_decisions": int(self.meaningful_decisions),
             "forced_wait_decisions": int(self.forced_wait_decisions),
             "instantaneous_decisions": int(self.instantaneous_decisions),
@@ -1174,10 +1629,17 @@ class DynamicPatrolEnv(BaseEnv):
             "min_delta_t": float(delta.min()) if delta.size else 0.0,
             "max_delta_t": float(delta.max()) if delta.size else 0.0,
             "mean_transition_discount": float(discounts.mean()) if discounts.size else 0.0,
+            "delta_t_mean": float(delta.mean()) if delta.size else 0.0,
+            "delta_t_min": float(delta.min()) if delta.size else 0.0,
+            "delta_t_max": float(delta.max()) if delta.size else 0.0,
+            "effective_gamma_mean": float(discounts.mean()) if discounts.size else 0.0,
+            "effective_gamma_min": float(discounts.min()) if discounts.size else 0.0,
+            "effective_gamma_max": float(discounts.max()) if discounts.size else 0.0,
             "forced_wait_decision_rate": self.forced_wait_decisions / decisions if decisions else 0.0,
             "zero_duration_transition_rate": self.zero_duration_transitions / decisions if decisions else 0.0,
             "simulated_seconds_per_decision": float(self.sim.now) / decisions if decisions else 0.0,
-            "replay_transitions_per_simulated_hour": decisions / max(self.sim.now / 3600.0, 1e-12),
+            "policy_decisions_per_simulated_hour": self.policy_decision_count / max(self.sim.now / 3600.0, 1e-12),
+            "replay_transitions_per_simulated_hour": self.policy_decision_count / max(self.sim.now / 3600.0, 1e-12),
             "wall_clock_time_ms": float(sum(row.get("wall_clock_step_time_ms", 0.0) for row in self.transition_log)),
         }
 

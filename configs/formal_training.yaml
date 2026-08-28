@@ -1,0 +1,13 @@
+# Formal 100k Rainbow DQN training using the default reward, time-aware SMDP
+# discount, task generation, and path-planning configuration.
+base: default_training.yaml
+
+project:
+  name: dynamic_patrol_formal
+  results_dir: results/xinjiekou_333/formal_training
+  tensorboard_dir: results/xinjiekou_333/formal_training/tensorboard
+
+rl:
+  timesteps: 100000
+  run_name: formal_training
+  model_name: rainbow_dqn_formal.pt

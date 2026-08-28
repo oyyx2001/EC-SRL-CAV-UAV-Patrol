@@ -56,8 +56,8 @@ class Simulator:
         # ``horizon`` is retained as the physical hard upper bound for legacy
         # callers.  Task generation/release use ``task_release_horizon``.
         self.horizon = self.hard_horizon
-        self.task_generator = TaskGenerator(cfg, self.network, self.seed)
-        formal_task_cfg = dict(cfg.get("xinjiekou_tasks", {}) or {})
+        self.task_generator: Optional[TaskGenerator] = None
+        formal_task_cfg = dict(cfg.get("edge_tasks", cfg.get("xinjiekou_tasks", {})) or {})
         task_source_cfg = dict(cfg.get("xinjiekou_task_source", {}) or {})
         mapping_mode = str(formal_task_cfg.get("mapping_mode", task_source_cfg.get("mapping_source", "generated")))
         self.task_mapping_source = mapping_mode
@@ -95,6 +95,7 @@ class Simulator:
             if self.task_mapping_unmapped and bool(task_source_cfg.get("require_complete_mapping", True)):
                 raise ValueError(f"Xinjiekou task mapping incomplete: {self.task_mapping_unmapped}")
         else:
+            self.task_generator = TaskGenerator(cfg, self.network, self.seed)
             self.tasks = self.task_generator.generate_episode_tasks()
         self.task_pool = TaskPool(
             self.tasks,
@@ -163,6 +164,9 @@ class Simulator:
         if self.decision_mode not in {"sortie_only", "separate_control", "joint_plan"}:
             raise ValueError(f"Unknown decision_mode: {self.decision_mode}")
         self.joint_plan_generator = JointPlanGenerator(self) if self.decision_mode == "joint_plan" else None
+        self.fixed_cav_patrol_enabled = bool(self.ground_controller.cfg.get("passive_patrol", {}).get("enabled", False))
+        if self.fixed_cav_patrol_enabled:
+            self._maintain_fixed_cav_patrol(0.0)
 
     def reset(self) -> None:
         self.__init__(self.cfg, self.seed, self.scenario)
@@ -432,8 +436,11 @@ class Simulator:
             self._recover_waiting_drones(event_time)
         # Recover if vehicle is already at a waiting drone's recovery point.
         self._recover_waiting_drones(event_time)
-        if self.vehicle.is_idle() and not self.ground_controller.active:
-            self._set_vehicle_next_recovery_target(event_time)
+        if self.vehicle.is_idle():
+            if self.fixed_cav_patrol_enabled:
+                self._maintain_fixed_cav_patrol(event_time)
+            elif not self.ground_controller.active:
+                self._set_vehicle_next_recovery_target(event_time)
         self.now += dt
         self.task_pool.update_release_and_expiry(self.now)
 
@@ -621,6 +628,45 @@ class Simulator:
             return
         self.vehicle.set_target(target, self.network, timestamp)
         self.event_log.append({"time": timestamp, "event": "vehicle_depart", "agent": self.vehicle.id, "node": self.vehicle.position, "target": target, "tasks": ""})
+
+    def _maintain_fixed_cav_patrol(self, event_time: Optional[float] = None) -> None:
+        """Keep the fixed-CAV baseline moving on a deterministic legal cycle.
+
+        The policy is restricted to ``keep_route`` in this ablation.  When a
+        physical FIFO recovery is pending, it still takes precedence; otherwise
+        the CAV follows a reproducible out-and-back directed route from its
+        current node.  This avoids the invalid stationary-vehicle baseline.
+        """
+
+        if not self.fixed_cav_patrol_enabled or not self.vehicle.is_idle():
+            return
+        timestamp = self.now if event_time is None else float(event_time)
+        if self.vehicle.is_waiting(timestamp):
+            return
+        if self.recovery_queue:
+            self._set_vehicle_next_recovery_target(timestamp)
+            return
+        current = int(self.vehicle.position)
+        outgoing = sorted(
+            (int(v) for _, v in self.network.G.out_edges(current)),
+            key=lambda node: (float(self.network.G[current][node]["vehicle_time_s"]), node),
+        )
+        for next_node in outgoing:
+            return_path = self.network.get_vehicle_path(next_node, current)
+            if not return_path or len(return_path) < 2:
+                continue
+            route = [current, next_node, *[int(node) for node in return_path[1:]]]
+            self.vehicle.set_route(route, self.network, timestamp)
+            self.event_log.append({
+                "time": timestamp,
+                "event": "vehicle_passive_patrol_depart",
+                "agent": self.vehicle.id,
+                "node": current,
+                "target": int(route[-1]),
+                "tasks": "",
+            })
+            return
+        raise RuntimeError(f"fixed CAV patrol has no directed cycle from node {current}")
 
     def _sync_idle_drones_with_vehicle(self) -> None:
         for drone in self.drones:

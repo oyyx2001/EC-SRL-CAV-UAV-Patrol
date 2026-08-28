@@ -7,26 +7,73 @@ from typing import Any, Deque, Dict, Iterable, List, Sequence
 import numpy as np
 
 
+DISCOUNT_MODES = ("fixed_decision", "time_aware")
+
+
+def canonical_discount_mode(discount_mode: str) -> str:
+    """Return the public discount mode name, accepting one legacy alias."""
+
+    mode = str(discount_mode).lower()
+    if mode == "continuous_time":
+        mode = "time_aware"
+    if mode not in DISCOUNT_MODES:
+        raise ValueError(f"unknown discount_mode: {discount_mode!r}; expected one of {DISCOUNT_MODES}")
+    return mode
+
+
+def resolve_discount_settings(cfg: Dict[str, Any]) -> tuple[str, float, float, int]:
+    """Resolve the public ``rl`` discount interface with legacy fallbacks."""
+
+    rl_cfg = dict(cfg.get("rl", {}) or {})
+    hp_cfg = dict(rl_cfg.get("hyperparams", {}) or {})
+    legacy_cfg = dict(cfg.get("smdp", {}) or {})
+    mode = canonical_discount_mode(
+        rl_cfg.get("discount_mode", legacy_cfg.get("discount_mode", "time_aware"))
+    )
+    gamma = float(
+        rl_cfg.get("gamma", hp_cfg.get("gamma", legacy_cfg.get("gamma_reference", 0.99)))
+    )
+    reference_time_s = float(
+        rl_cfg.get(
+            "discount_reference_time_s",
+            legacy_cfg.get("reference_interval_s", 60.0),
+        )
+    )
+    n_step = int(rl_cfg.get("n_step", legacy_cfg.get("n_step", 1)))
+    # Reuse transition_discount for complete numerical validation.
+    transition_discount(gamma, 0.0, reference_time_s, mode)
+    if n_step < 1:
+        raise ValueError("n_step must be >= 1")
+    return mode, gamma, reference_time_s, n_step
+
+
 def transition_discount(
     gamma_reference: float,
     delta_t: float,
     reference_interval_s: float = 60.0,
-    discount_mode: str = "continuous_time",
+    discount_mode: str = "time_aware",
 ) -> float:
-    """Return the effective SMDP bootstrap discount for one transition."""
+    """Return the effective SMDP bootstrap discount for one transition.
+
+    ``delta_t`` and ``reference_interval_s`` are measured in seconds.  A zero
+    duration is valid and has an effective discount of one in time-aware mode.
+    """
 
     gamma = float(gamma_reference)
     duration = float(delta_t)
     reference = float(reference_interval_s)
-    if duration < -1e-9:
+    if not np.isfinite(duration):
+        raise ValueError(f"delta_t must be finite, got {duration}")
+    if duration < 0.0:
         raise ValueError(f"delta_t must be non-negative, got {duration}")
-    if reference <= 0.0:
-        raise ValueError("reference_interval_s must be positive")
-    if discount_mode == "fixed_decision":
+    if not np.isfinite(reference) or reference <= 0.0:
+        raise ValueError("reference_interval_s must be finite and positive")
+    if not np.isfinite(gamma) or not 0.0 <= gamma <= 1.0:
+        raise ValueError("gamma_reference must be finite and in [0, 1]")
+    mode = canonical_discount_mode(discount_mode)
+    if mode == "fixed_decision":
         return gamma
-    if discount_mode != "continuous_time":
-        raise ValueError(f"unknown discount_mode: {discount_mode}")
-    return float(gamma ** (max(0.0, duration) / reference))
+    return float(gamma ** (duration / reference))
 
 
 def one_step_smdp_target(
@@ -35,6 +82,7 @@ def one_step_smdp_target(
     dones: Any,
     next_q: Any,
 ) -> Any:
+    """Compute ``r + (1-done) * gamma_t * next_q`` element-wise."""
     return rewards + (1.0 - dones) * bootstrap_discounts * next_q
 
 
@@ -83,11 +131,12 @@ class NStepSMDPAccumulator:
             total_delta_t += float(item.delta_t)
             discount_product *= float(item.bootstrap_discount)
             terminal_index = index
-            # A time-limit truncation ends the sampled sequence and flushes
-            # the accumulator, but it is not an MDP terminal state.  Preserve
-            # its bootstrap factor; Rainbow will mask only ``terminated``.
+            # Terminal state is represented separately by ``done``.  Preserve
+            # gamma_t even at the terminal transition so fixed_decision always
+            # stores gamma and time_aware always stores the duration formula;
+            # the TD target's done mask is solely responsible for suppressing
+            # bootstrap.
             if item.terminated:
-                discount_product = 0.0
                 break
             if item.truncated:
                 break

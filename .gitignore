@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.matplotlib/
 
 # Virtual environments
 .venv/
@@ -21,7 +22,12 @@ Thumbs.db
 results/
 runs/
 logs/
+outputs/
 *.log
+
+# Local tooling and review artifacts
+.codex_work/
+tmp/
 
 # Model/checkpoint artifacts
 *.pt

@@ -56,10 +56,11 @@ class RoadNetwork:
     def _build(self) -> None:
         net_cfg = self.cfg["network"]
         kind = net_cfg.get("type", "synthetic_grid")
-        if kind not in {"synthetic_grid", "irregular_city", "imported_osm", "xinjiekou_graphml"}:
-            raise ValueError(f"Supported network types: synthetic_grid, irregular_city, imported_osm, xinjiekou_graphml; got {kind}")
+        supported = {"synthetic_grid", "irregular_city", "imported_osm", "xinjiekou_graphml", "compressed_region_graphml"}
+        if kind not in supported:
+            raise ValueError(f"Supported network types: {', '.join(sorted(supported))}; got {kind}")
         rng = np.random.default_rng(int(self.cfg["project"].get("seed", 42)) + int(net_cfg.get("risk_seed_shift", 100)))
-        if kind == "xinjiekou_graphml":
+        if kind in {"xinjiekou_graphml", "compressed_region_graphml"}:
             self._build_xinjiekou_graphml(net_cfg)
         elif kind == "irregular_city":
             self._build_irregular_city(net_cfg, rng)
@@ -70,14 +71,14 @@ class RoadNetwork:
         self._assign_risk(rng)
 
     def _build_xinjiekou_graphml(self, net_cfg: Dict) -> None:
-        """Load packaged Xinjiekou roads into the integer-only simulation space."""
+        """Load a packaged compressed regional graph into simulation IDs."""
         graphml = self._resolve_import_path(net_cfg["graphml_file"])
         source = nx.read_graphml(graphml, force_multigraph=True)
         self.source_graph_type = type(source).__name__
         self.source_edge_count = int(source.number_of_edges())
         expected = int(net_cfg.get("expected_node_count", 333))
         if source.number_of_nodes() != expected or source.number_of_edges() != int(net_cfg.get("expected_edge_count", 601)):
-            raise ValueError(f"Unexpected Xinjiekou graph size: {source.number_of_nodes()} nodes, {source.number_of_edges()} edges")
+            raise ValueError(f"Unexpected compressed region graph size: {source.number_of_nodes()} nodes, {source.number_of_edges()} edges")
         external_ids = sorted(str(node) for node in source.nodes)
         self.external_to_internal = {node: index for index, node in enumerate(external_ids)}
         self.internal_to_external = {index: node for node, index in self.external_to_internal.items()}
@@ -87,11 +88,11 @@ class RoadNetwork:
                 geometry = data.get("geometry")
                 point = wkt.loads(geometry) if isinstance(geometry, str) else geometry
                 if point is None or not hasattr(point, "x"):
-                    raise ValueError(f"Missing Xinjiekou coordinates for {external}")
+                    raise ValueError(f"Missing compressed region coordinates for {external}")
                 data = dict(data, x=float(point.x), y=float(point.y))
             x, y = float(data["x"]), float(data["y"])
             if not math.isfinite(x) or not math.isfinite(y):
-                raise ValueError(f"Invalid Xinjiekou coordinates for {external}")
+                raise ValueError(f"Invalid compressed region coordinates for {external}")
             self.G.add_node(internal, x=x, y=y, external_id=external)
         directed = source.is_directed()
         edges = source.edges(keys=True, data=True) if source.is_multigraph() else ((u, v, 0, d) for u, v, d in source.edges(data=True))
@@ -99,7 +100,7 @@ class RoadNetwork:
             iu, iv = self.external_to_internal[str(u)], self.external_to_internal[str(v)]
             length = float(data.get("length_m", data.get("network_distance_m", self._distance(iu, iv))))
             travel = float(data.get("travel_time_s", data.get("estimated_travel_time_s", length / max(float(net_cfg.get("vehicle_speed_mps", 8.3)), 1e-9))))
-            attrs = dict(data, length_m=length, vehicle_time_s=travel, vehicle_speed_mps=length / max(travel, 1e-9), source="xinjiekou_graphml")
+            attrs = dict(data, length_m=length, vehicle_time_s=travel, vehicle_speed_mps=length / max(travel, 1e-9), source="compressed_region_graphml")
             self._add_best_graphml_arc(iu, iv, attrs)
             if not directed:
                 # Source is an undirected MultiGraph: each physical road is usable

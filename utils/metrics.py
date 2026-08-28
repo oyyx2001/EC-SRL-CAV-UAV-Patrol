@@ -86,6 +86,7 @@ class EpisodeMetrics:
     joint_reroute_rate: float = 0.0
     return_guard_rejection_rate: float = 0.0
     commit_failure_count: int = 0
+    path_planning_failure_count: int = 0
     rollback_count: int = 0
     atomic_commit_failure_rate: float = 0.0
     rollback_rate: float = 0.0

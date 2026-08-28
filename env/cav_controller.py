@@ -12,6 +12,24 @@ from collections import Counter
 GROUND_ACTIONS = ("keep_route", "wait", "move_to", "reroute")
 
 
+def is_immediate_route_reversal(
+    planned_route: Sequence[int],
+    route_edge_log: Sequence[Tuple[float, int, int]],
+) -> bool:
+    """Return whether the next CAV edge immediately reverses the last edge.
+
+    ``route_edge_log`` stores ``(time, from_node, to_node)``.  When the CAV is
+    currently at ``to_node``, selecting ``from_node`` as the next route node is
+    the exact directed-edge reversal that the stability guard is meant to
+    detect.
+    """
+
+    if len(planned_route) <= 1 or not route_edge_log:
+        return False
+    previous_node = int(route_edge_log[-1][1])
+    return int(planned_route[1]) == previous_node
+
+
 @dataclass
 class GroundCandidate:
     """A side-effect-free rolling-horizon CAV action proposal."""
@@ -115,6 +133,17 @@ class ActiveCAVController:
         """
 
         return self.mode in {"active_rule_based", "joint_plan"} and len(self.action_set) > 1
+
+    @property
+    def queue_aware_recovery(self) -> bool:
+        """Whether queue state may enter proposal generation or scoring.
+
+        ``queue_blind`` retains the physical FIFO queue and its safety checks,
+        but the policy-side candidate generator must not condition its proposed
+        actions, candidate scores, or feature values on that queue.
+        """
+
+        return bool(self.sim.cfg.get("ablation", {}).get("queue_aware_recovery", True))
 
     def state_fingerprint(self) -> Tuple[Any, ...]:
         vehicle = self.sim.vehicle
@@ -247,11 +276,13 @@ class ActiveCAVController:
     def _next_wait_end(self, next_event_time: Optional[float]) -> float:
         now = float(self.sim.now)
         upper = now + float(self.cfg.get("max_wait_s", 120.0))
-        future_times = [
-            float(entry.get("eta", math.inf))
-            for entry in self.sim.recovery_queue
-            if float(entry.get("eta", math.inf)) > now + 1e-9
-        ]
+        future_times = []
+        if self.queue_aware_recovery:
+            future_times.extend(
+                float(entry.get("eta", math.inf))
+                for entry in self.sim.recovery_queue
+                if float(entry.get("eta", math.inf)) > now + 1e-9
+            )
         if next_event_time is not None and float(next_event_time) > now + 1e-9:
             future_times.append(float(next_event_time))
         future_times.append(upper)
@@ -309,11 +340,12 @@ class ActiveCAVController:
             if old is None or priority < old[2]:
                 specs[node] = value
 
-        for index, entry in enumerate(self.sim.recovery_queue):
-            recovery_id = self._entry_id(entry)
-            add(int(entry["recovery_node"]), recovery_id if self._entry_is_flexible(index, entry) else None, "recovery", 0)
-            for node in self._rendezvous_nodes(index, entry):
-                add(node, recovery_id, "rendezvous", 1)
+        if self.queue_aware_recovery:
+            for index, entry in enumerate(self.sim.recovery_queue):
+                recovery_id = self._entry_id(entry)
+                add(int(entry["recovery_node"]), recovery_id if self._entry_is_flexible(index, entry) else None, "recovery", 0)
+                for node in self._rendezvous_nodes(index, entry):
+                    add(node, recovery_id, "rendezvous", 1)
         current = int(self.sim.vehicle.position)
         for _, node in sorted(self.sim.network.G.out_edges(current)):
             add(int(node), None, "adjacent", 3)
@@ -352,12 +384,14 @@ class ActiveCAVController:
         if "wait" in self.action_set:
             wait_updates: Dict[str, int] = {}
             wait_affected: List[str] = []
-            flexible = [
-                (index, entry)
-                for index, entry in enumerate(self.sim.recovery_queue)
-                if self._entry_is_flexible(index, entry)
-                and self._predict_entry_update(entry, current) is not None
-            ]
+            flexible = []
+            if self.queue_aware_recovery:
+                flexible = [
+                    (index, entry)
+                    for index, entry in enumerate(self.sim.recovery_queue)
+                    if self._entry_is_flexible(index, entry)
+                    and self._predict_entry_update(entry, current) is not None
+                ]
             if flexible:
                 _, entry = min(
                     flexible,
@@ -595,7 +629,9 @@ class ActiveCAVController:
         }
 
     def _trial_queue(self, candidate: GroundCandidate) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-        queue = deepcopy(self.sim.recovery_queue)
+        # This is the *policy* queue.  Physical FIFO validation is carried out
+        # later by the recovery scheduler when a selected plan is committed.
+        queue = deepcopy(self.sim.recovery_queue) if self.queue_aware_recovery else []
         locked = self._locked_prefix(queue)
         for index, entry in enumerate(queue):
             entry_id = self._entry_id(entry)
@@ -751,9 +787,10 @@ class ActiveCAVController:
                 overlap += 1
             candidate.route_prefix_overlap = overlap / max(1, len(current_route))
 
-        if len(route) > 1 and vehicle.route_edge_log:
-            previous_node = int(vehicle.route_edge_log[-1][1])
-            candidate.reverse_route_flag = int(route[1]) == previous_node
+        candidate.reverse_route_flag = is_immediate_route_reversal(
+            route,
+            vehicle.route_edge_log,
+        )
         recent_changes = vehicle.recent_route_change_count(
             now, float(self.commit_cfg.get("commitment_horizon_s", 180.0))
         )
@@ -780,14 +817,16 @@ class ActiveCAVController:
                 ),
             )
         )
+        recovery_wait_weight = float(self.cost_cfg.get("weight_recovery_wait", 1.0)) if self.queue_aware_recovery else 0.0
+        cav_wait_weight = float(self.cost_cfg.get("weight_cav_wait", 0.25)) if self.queue_aware_recovery else 0.0
         candidate.score = float(
-            float(self.cost_cfg.get("weight_recovery_wait", 1.0))
+            recovery_wait_weight
             * candidate.predicted_uav_wait
             / horizon
             + float(self.cost_cfg.get("weight_uav_return", 0.5))
             * candidate.predicted_uav_return_time
             / horizon
-            + float(self.cost_cfg.get("weight_cav_wait", 0.25))
+            + cav_wait_weight
             * candidate.predicted_cav_wait
             / horizon
             + float(self.cost_cfg.get("weight_detour", 0.30))
@@ -1236,6 +1275,8 @@ class ActiveCAVController:
                     "seed": int(self.sim.seed),
                     "simulation_time": now,
                     "action": candidate.action_type,
+                    "action_type": candidate.action_type,
+                    "route_changed": bool(candidate.route_changed),
                     "old_target": old_target,
                     "new_target": vehicle.target_node,
                     "old_route": "|".join(str(x) for x in old_route),
@@ -1276,8 +1317,14 @@ class ActiveCAVController:
             "move_to_count": counts["move_to"],
             "reroute_count": counts["reroute"],
             "non_keep_action_rate": len(selected_non_keep) / len(rows) if rows else 0.0,
-            "route_change_count": len(self.route_change_log),
-            "route_reversal_count": sum(bool(row.get("reverse_route_flag")) for row in self.route_change_log),
+            "route_change_count": sum(
+                bool(row.get("route_changed")) and not bool(row.get("emergency_override"))
+                for row in self.route_change_log
+            ),
+            "route_reversal_count": sum(
+                bool(row.get("reverse_route_flag")) and not bool(row.get("emergency_override"))
+                for row in self.route_change_log
+            ),
             "emergency_override_count": sum(bool(row.get("emergency_override")) for row in self.route_change_log),
             "mean_route_commitment_time_s": self.sim.vehicle.mean_route_commitment_time(),
             "ground_candidate_count": float(sum(row.get("candidate_count", 0) for row in rows) / len(rows)) if rows else 0.0,
