@@ -499,6 +499,14 @@ class RoadNetwork:
     def get_vehicle_time(self, i: int, j: int) -> float:
         return float(self.vehicle_time.get(self.to_internal_node(i), {}).get(self.to_internal_node(j), math.inf))
 
+    def get_vehicle_edge_time(self, i: int, j: int, *, actual: bool = False) -> float:
+        u, v = self.to_internal_node(i), self.to_internal_node(j)
+        if not self.G.has_edge(u, v):
+            return math.inf
+        data = self.G[u][v]
+        key = "actual_vehicle_time_s" if actual else "vehicle_time_s"
+        return float(data.get(key, data["vehicle_time_s"]))
+
     def get_vehicle_path(self, i: int, j: int) -> List[int]:
         return list(self.vehicle_paths.get(self.to_internal_node(i), {}).get(self.to_internal_node(j), []))
 

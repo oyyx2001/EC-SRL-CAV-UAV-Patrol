@@ -36,8 +36,24 @@ network:
   map_version: xinjiekou_default_v1
   max_launch_recovery_match_distance_m: 5.0
   patrol_center: center
-  vehicle_speed_mps: 8.3
+  vehicle_speed_mps: 8.333333333333334
   drone_speed_mps: 10.0
+
+# Planner-facing CAV speeds are deterministic stage means. A hidden speed
+# multiplier is sampled only when the committed CAV enters an edge, and again
+# for the remaining distance when a stage boundary is crossed.
+time_varying_traffic:
+  enabled: true
+  mode: staged_random_speed
+  seed_offset: 73031
+  speed_multiplier_mean: 1.0
+  speed_multiplier_std: 0.1
+  speed_multiplier_min: 0.8
+  speed_multiplier_max: 1.2
+  speed_stages:
+    - {start_s: 0.0, end_s: 3600.0, mean_speed_kmh: 30.0}
+    - {start_s: 3600.0, end_s: 7200.0, mean_speed_kmh: 20.0}
+    - {start_s: 7200.0, end_s: 12600.0, mean_speed_kmh: 30.0}
 
 agents:
   num_vehicles: 1
@@ -47,8 +63,46 @@ agents:
   drone_hover_power: 0.65
   drone_service_power: 0.85
   battery_swap_time_s: 0
-  launch_time_s: 0
-  recovery_time_s: 0
+  # Planners use conservative upper bounds. The Xinjiekou simulator samples
+  # hidden realized handling times after each selected plan is committed.
+  launch_time_s: 70.0
+  recovery_time_s: 35.0
+
+operational_time_uncertainty:
+  enabled: true
+  launch:
+    enabled: true
+    distribution: truncated_normal
+    mean_s: 60.0
+    std_s: 3.3333333333333335
+    min_s: 50.0
+    max_s: 70.0
+    planning_estimate_mode: upper_bound
+  recovery:
+    enabled: true
+    distribution: truncated_normal
+    mean_s: 30.0
+    std_s: 1.6666666666666667
+    min_s: 25.0
+    max_s: 35.0
+    planning_estimate_mode: upper_bound
+
+# Optional zero-shot execution perturbations for operational-uncertainty
+# analysis. Disabled during training and ordinary evaluation. The planner
+# continues to use nominal/current prediction values; these factors are
+# sampled only when the corresponding physical operation starts.
+operational_execution_uncertainty:
+  enabled: false
+  cav_travel_time:
+    enabled: false
+    distribution: uniform
+    delta: 0.0
+    reference: current_actual
+  recovery_time:
+    enabled: false
+    distribution: uniform
+    delta: 0.0
+    reference: current_actual
 
 uav_flight:
   cruise_height_m: 60.0
@@ -187,10 +241,10 @@ uav_return_guard:
   minimum_battery_slack: 0
 
 recovery:
-  rule: fifo
+  rule: dynamic_insertion
 
 recovery_insertion:
-  enabled: false
+  enabled: true
   lock_horizon_s: 120
   preserve_locked_prefix: true
   weight_uav_wait: 1.0

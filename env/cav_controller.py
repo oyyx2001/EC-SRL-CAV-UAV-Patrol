@@ -173,6 +173,7 @@ class ActiveCAVController:
             vehicle.target_node,
             int(vehicle.schedule_version),
             int(self.sim.recovery_schedule_version),
+            int(getattr(self.sim, "traffic_state_version", 0)),
             queue,
             drones,
         )
@@ -586,7 +587,11 @@ class ActiveCAVController:
             if str(segments[i].get("type")) in {"fly", "horizontal_flight"}),
             len(segments) - 1,
         )
-        remaining_time = 0.0
+        remaining_time = (
+            max(0.0, float(getattr(drone, "launch_remaining_s", 0.0)))
+            if drone.status == "launching"
+            else 0.0
+        )
         remaining_energy = 0.0
         return_time = 0.0
         for index in range(drone.segment_index, len(segments)):

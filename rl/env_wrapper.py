@@ -550,6 +550,14 @@ class DynamicPatrolEnv(BaseEnv):
             entity_id="episode",
             current_time=now,
         )
+        for index, update_time in enumerate(self.sim.traffic.update_times(hard_horizon), start=1):
+            self.event_queue.schedule(
+                time=float(update_time),
+                event_type="TRAFFIC_UPDATE",
+                entity_id=f"traffic:{index}",
+                payload={"traffic_epoch": int(index)},
+                current_time=now,
+            )
         self._schedule_dynamic_events()
 
     def _event_version(self, event: Event) -> Optional[int]:
@@ -588,7 +596,23 @@ class DynamicPatrolEnv(BaseEnv):
             return
         tolerance = self.event_queue.time_tolerance
         vehicle = self.sim.vehicle
-        if vehicle.is_waiting(self.sim.now):
+        if (
+            vehicle.target_node is not None
+            and not vehicle.is_operationally_held(self.sim.now)
+            and not vehicle.is_waiting(self.sim.now)
+        ):
+            # The action has already been committed. Realize physical speed
+            # only when the CAV is about to enter/resume the road edge.
+            vehicle.ensure_edge_realization(self.sim.now, self.sim.network)
+        if vehicle.is_operationally_held(self.sim.now):
+            self._schedule_entity_event(
+                vehicle.id,
+                vehicle.schedule_version,
+                float(vehicle.operation_hold_until),
+                "CAV_LAUNCH_HOLD_COMPLETE",
+                {"node": int(vehicle.position)},
+            )
+        elif vehicle.is_waiting(self.sim.now):
             self._schedule_entity_event(
                 vehicle.id,
                 vehicle.schedule_version,
@@ -597,7 +621,10 @@ class DynamicPatrolEnv(BaseEnv):
                 {"node": int(vehicle.position)},
             )
         elif vehicle.target_node is not None and vehicle.edge_remaining_time > tolerance:
-            reaches_recovery = vehicle.edge_remaining_time >= vehicle.remaining_time - tolerance
+            reaches_recovery = bool(
+                vehicle.path_nodes
+                and vehicle.path_index >= len(vehicle.path_nodes) - 2
+            )
             event_type = "CAV_RECOVERY_NODE_ARRIVAL" if reaches_recovery else "CAV_NODE_ARRIVAL"
             next_node = (
                 int(vehicle.path_nodes[vehicle.path_index + 1])
@@ -612,6 +639,15 @@ class DynamicPatrolEnv(BaseEnv):
                 {"node": next_node},
             )
         for drone in self.sim.drones:
+            if drone.status == "launching" and drone.sortie is not None:
+                self._schedule_entity_event(
+                    drone.id,
+                    drone.schedule_version,
+                    self.sim.now + max(0.0, float(drone.launch_remaining_s)),
+                    "UAV_TAKEOFF",
+                    {"launch_node": int(drone.sortie.launch_node)},
+                )
+                continue
             if drone.status != "flying" or drone.sortie is None:
                 continue
             if drone.segment_index >= len(drone.sortie.segments):
@@ -652,6 +688,8 @@ class DynamicPatrolEnv(BaseEnv):
                 for status in ("unreleased", "unassigned", "assigned", "executing", "done", "expired")
             },
             "queue_length": len(self.sim.recovery_queue),
+            "traffic_epoch": int(getattr(self.sim.traffic, "current_epoch", -1)),
+            "traffic_state_version": int(getattr(self.sim, "traffic_state_version", 0)),
         }
 
     def _scheduling_fingerprint(self) -> Tuple[Any, ...]:
@@ -703,7 +741,8 @@ class DynamicPatrolEnv(BaseEnv):
                 for entry in self.sim.recovery_queue
             )
         )
-        return available, idle_on_vehicle, route, recovery
+        traffic = int(getattr(self.sim, "traffic_state_version", 0))
+        return available, idle_on_vehicle, route, recovery, traffic
 
     def _candidate_signature(self) -> Tuple[Any, ...]:
         """Identify substantive action-set changes without comparing features."""
@@ -775,6 +814,8 @@ class DynamicPatrolEnv(BaseEnv):
                 sorted(event_set & {"UAV_RECOVERED", "CAV_RECOVERY_COMPLETE", "UAV_RECOVERY_ARRIVAL"})
                 or ["RECOVERY_PLAN_CHANGED"]
             )
+        if len(before) > 4 and before[4] != after[4]:
+            sources.append("TRAFFIC_UPDATE")
         if candidate_changed:
             sources.append("CANDIDATE_SET_CHANGED")
         return list(dict.fromkeys(sources or ["SCHEDULING_STATE_CHANGED"]))
@@ -1263,6 +1304,9 @@ class DynamicPatrolEnv(BaseEnv):
                     # an event at the current timestamp.  Without this flush,
                     # the same dynamic event is immediately scheduled again.
                     self.sim.step(0.0)
+                if any(event.event_type == "TRAFFIC_UPDATE" for event in batch):
+                    self.sim.update_traffic(float(next_time))
+                    self.joint_plan_cache = None
                 self._capture_cutoff_state()
                 derived_map = {
                     "task_done": "TASK_SERVICE_COMPLETE",
@@ -1750,7 +1794,7 @@ class DynamicPatrolEnv(BaseEnv):
             sim.now / horizon,
             sim.vehicle.position / n_nodes,
             (sim.vehicle.target_node if sim.vehicle.target_node is not None else sim.vehicle.position) / n_nodes,
-            sim.vehicle.remaining_time / horizon,
+            sim.vehicle.planned_remaining_time(sim.now, sim.network) / horizon,
             (len(sim.recovery_queue) / max(1.0, len(sim.drones))) if use_queue_aware_recovery else 0.0,
             1.0 if sim.vehicle.at_intersection else 0.0,
         ]
@@ -1774,7 +1818,14 @@ class DynamicPatrolEnv(BaseEnv):
         if self.decision_mode == "joint_plan":
             if self.joint_plan_cache is None:
                 raise RuntimeError("joint plan decision cache has not been prepared")
-            obs.extend(self.joint_plan_cache.feature_matrix.reshape(-1).tolist())
+            if use_candidate_features:
+                obs.extend(self.joint_plan_cache.feature_matrix.reshape(-1).tolist())
+            else:
+                # State-only ablation: retain identical candidate generation,
+                # slot ordering, action masks and observation dimensionality,
+                # but prevent every candidate-specific field from reaching the
+                # policy network.
+                obs.extend([0.0] * (self.max_candidates_obs * self.plan_feature_dim))
         elif use_candidate_features:
             for c in self.candidates[: self.max_candidates_obs]:
                 obs.extend([

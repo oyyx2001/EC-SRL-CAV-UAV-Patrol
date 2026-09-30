@@ -11,7 +11,7 @@ class Drone:
     position: int
     battery_capacity: float
     battery: float
-    status: str = "idle"  # idle, flying, waiting_recovery, charging
+    status: str = "idle"  # idle, launching, flying, waiting_recovery, recovering, charging
     sortie: Optional[Any] = None
     segment_index: int = 0
     segment_remaining: float = 0.0
@@ -30,6 +30,9 @@ class Drone:
     path_progress_m: float = 0.0
     task_arrival_times: Dict[int, float] = field(default_factory=dict)
     recovery_eta: Optional[float] = None
+    recovery_remaining_s: float = 0.0
+    launch_remaining_s: float = 0.0
+    actual_launch_duration_s: float = 0.0
 
     def is_idle(self) -> bool:
         return self.status == "idle"
@@ -42,7 +45,8 @@ class Drone:
         self.sortie = None
         self.segment_index = 0
         self.segment_remaining = 0.0
-        self.active_voxel_path.clear(); self.active_path_xyz.clear(); self.task_arrival_times.clear(); self.recovery_eta = None
+        self.active_voxel_path.clear(); self.active_path_xyz.clear(); self.task_arrival_times.clear(); self.recovery_eta = None; self.recovery_remaining_s = 0.0
+        self.launch_remaining_s = 0.0; self.actual_launch_duration_s = 0.0
         self.log.append((now, "recovered", int(node)))
 
     def assign_sortie(self, sortie: Any, now: float) -> None:
@@ -50,7 +54,10 @@ class Drone:
             raise ValueError(f"Drone {self.id} is not idle")
         self.schedule_version += 1
         self.sortie = sortie
-        self.status = "flying"
+        launch_duration = max(0.0, float(getattr(sortie, "actual_launch_time_s", 0.0)))
+        self.actual_launch_duration_s = launch_duration
+        self.launch_remaining_s = launch_duration
+        self.status = "launching" if launch_duration > 1e-9 else "flying"
         self.segment_index = 0
         self.segment_remaining = sortie.segments[0]["duration"] if sortie.segments else 0.0
         self.active_voxel_path = list(getattr(sortie, "active_voxel_path", [])); self.active_path_xyz = list(getattr(sortie, "active_path_xyz", []))

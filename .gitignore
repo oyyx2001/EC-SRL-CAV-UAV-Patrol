@@ -27,8 +27,15 @@ outputs/
 
 # Local tooling and review artifacts
 .codex_work/
+.agents/
+.codex/
+.codex-build/
+.codex-finalizer/
+artifacts/
+Paper/
+manuscript/
+figure/
 tmp/
-manuscript/rendered/page-*.png
 
 # Generated map, benchmark, and visualization artifacts
 data/jiangning_osm/
@@ -38,6 +45,9 @@ truck_uav_modules/data/path_planning_3d_benchmark/
 truck_uav_modules/data/path_planning_3d_comparison/
 truck_uav_modules/data/processed_3d_voxel_grids_road_clearance_v1/
 truck_uav_modules/data/processed_3d_voxel_grids_road_free_20_120m/
+truck_uav_modules/data/processed_3d_voxel_grids/
+truck_uav_modules/data/processed_grid_layers/
+truck_uav_modules/data/processed_grid_layers_with_launch_recovery/
 
 # Model/checkpoint artifacts
 *.pt
@@ -45,6 +55,7 @@ truck_uav_modules/data/processed_3d_voxel_grids_road_free_20_120m/
 *.zip
 *.ckpt
 *.pkl
+*.docx
 
 # Temporary files
 *.tmp

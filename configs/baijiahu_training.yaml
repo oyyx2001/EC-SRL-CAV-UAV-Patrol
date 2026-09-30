@@ -11,6 +11,18 @@ experiment:
   scenario_name: baijiahu_default
   output_dir: results/baijiahu/default_training
 
+# Match the current Xinjiekou training mechanics while preserving the
+# Baijiahu-specific road network, voxel map, task registry and metadata.
+agents:
+  launch_time_s: 70.0
+  recovery_time_s: 35.0
+
+operational_time_uncertainty:
+  enabled: true
+
+time_varying_traffic:
+  enabled: true
+
 network:
   type: compressed_region_graphml
   graphml_file: truck_uav_modules/data/baijiahu/road_network.graphml
@@ -29,10 +41,11 @@ edge_tasks:
   registry_path: data/baijiahu/edge_task_registry.csv
 
 rl:
+  timesteps: 300000
   run_name: baijiahu_rainbow_default
   model_name: baijiahu_rainbow_dqn_default.pt
-  train_scenario: baijiahu_default
-  eval_scenario: baijiahu_default_eval
+  train_scenario: baijiahu_random_traffic_dynamic_insertion_train
+  eval_scenario: baijiahu_random_traffic_dynamic_insertion_eval
 
 training:
   task_mapping_version: baijiahu_direct_compressed_edge_v1

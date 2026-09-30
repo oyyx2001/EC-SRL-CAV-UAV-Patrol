@@ -32,6 +32,14 @@ class EpisodeMetrics:
     p95_uav_recovery_wait_s: float = 0.0
     total_uav_hover_time_s: float = 0.0
     total_hover_energy: float = 0.0
+    total_launch_service_time_s: float = 0.0
+    mean_actual_launch_time_s: float = 0.0
+    mean_actual_recovery_time_s: float = 0.0
+    planning_launch_time_s: float = 0.0
+    planning_recovery_time_s: float = 0.0
+    launch_time_sample_count: int = 0
+    recovery_time_sample_count: int = 0
+    total_recovery_service_time_s: float = 0.0
     mean_cav_waiting_time_s: float = 0.0
     cav_travel_distance_m: float = 0.0
     recovery_contention_rate: float = 0.0

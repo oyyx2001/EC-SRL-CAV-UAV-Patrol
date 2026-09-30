@@ -30,7 +30,9 @@ class RecoveryInsertionScheduler:
             "drone_id": str(drone.id),
             "recovery_node": int(sortie.recovery_node),
             "eta": float(self.sim.now + sortie.drone_time_s),
-            "recovery_duration": float(self.agent_cfg.get("recovery_time_s", 0.0)),
+            "recovery_duration": float(self.sim.planning_recovery_time_s),
+            "planned_recovery_duration_s": float(self.sim.planning_recovery_time_s),
+            "planned_launch_duration_s": float(getattr(sortie, "planned_launch_time_s", 0.0)),
             "battery_at_eta": battery_at_eta,
             "battery_reserve": reserve,
             "hover_power": float(self.agent_cfg.get("drone_hover_power", 0.65)),
@@ -45,6 +47,8 @@ class RecoveryInsertionScheduler:
             "launch_time": float(self.sim.now),
             "task_ids": list(sortie.task_ids),
             "recovery_arrival_time": None,
+            "recovery_service_start_time": None,
+            "recovery_service_finish_time": None,
         }
 
     def evaluate(self, sortie: Any, rule: str = "dynamic_insertion") -> Dict[str, Any]:
@@ -181,8 +185,9 @@ class RecoveryInsertionScheduler:
         max_results = max(0, int(max_results))
         if max_results == 0:
             return []
+        rule = "dynamic_insertion" if self.sim.dynamic_insertion_enabled else "fifo"
         if ground_plan_override is None:
-            result = self.evaluate(sortie, rule="dynamic_insertion")
+            result = self.evaluate(sortie, rule=rule)
             if not result.get("feasible", False):
                 return []
             diagnostics = result.get("diagnostics", {})
@@ -238,7 +243,12 @@ class RecoveryInsertionScheduler:
         append_sim = self.simulate_ground_plan(append_queue, first_arrival)
         append_parts = self._cost_parts(append_sim, append_sim, queue)
         append_cost = self._weighted_cost(append_parts)
-        for index in range(locked_prefix, append_index + 1):
+        positions = (
+            range(locked_prefix, append_index + 1)
+            if rule == "dynamic_insertion"
+            else (append_index,)
+        )
+        for index in positions:
             trial = [dict(entry) for entry in queue]
             trial.insert(index, dict(new_entry))
             simulated = self.simulate_ground_plan(trial, first_arrival)
@@ -302,9 +312,24 @@ class RecoveryInsertionScheduler:
 
     def simulate(self, queue: Sequence[Dict[str, Any]], new_sortie_id: Optional[str] = None) -> Dict[str, Any]:
         schedule: List[Dict[str, Any]] = []
-        current_time = float(self.sim.now)
+        planned_hold = max(
+            float(self.sim.vehicle.planned_operation_hold_remaining(self.sim.now)),
+            max(
+                (
+                    max(
+                        0.0,
+                        float(entry.get("launch_time", self.sim.now))
+                        + float(entry.get("planned_launch_duration_s", 0.0))
+                        - float(self.sim.now),
+                    )
+                    for entry in queue
+                ),
+                default=0.0,
+            ),
+        )
+        current_time = float(self.sim.now) + planned_hold
         current_node = int(self.sim.vehicle.position)
-        route_time = 0.0
+        route_time = float(planned_hold)
         active_target = self.sim.vehicle.target_node
         use_battery = bool(self.cfg.get("use_battery_feasibility", True))
 
@@ -315,7 +340,11 @@ class RecoveryInsertionScheduler:
         for index, entry in enumerate(queue):
             node = int(entry["recovery_node"])
             if index == 0 and active_target is not None:
-                travel_time = float(self.sim.vehicle.remaining_time)
+                travel_time = float(
+                    self.sim.vehicle.planned_remaining_time(
+                        self.sim.now, self.sim.network
+                    )
+                )
             else:
                 travel_time = float(self.sim.network.get_vehicle_time(current_node, node))
             if not math.isfinite(travel_time):
@@ -370,7 +399,22 @@ class RecoveryInsertionScheduler:
         if not queue:
             return {"feasible": True, "reason": "ok", "schedule": [], "route_time": 0.0}
         schedule: List[Dict[str, Any]] = []
-        current_time = float(first_cav_arrival_time)
+        planned_hold = max(
+            float(self.sim.vehicle.planned_operation_hold_remaining(self.sim.now)),
+            max(
+                (
+                    max(
+                        0.0,
+                        float(entry.get("launch_time", self.sim.now))
+                        + float(entry.get("planned_launch_duration_s", 0.0))
+                        - float(self.sim.now),
+                    )
+                    for entry in queue
+                ),
+                default=0.0,
+            ),
+        )
+        current_time = float(first_cav_arrival_time) + planned_hold
         current_node = int(queue[0]["recovery_node"])
         route_time = max(0.0, current_time - float(self.sim.now))
         use_battery = bool(self.cfg.get("use_battery_feasibility", True))
@@ -466,7 +510,15 @@ class RecoveryInsertionScheduler:
             round(float(self.sim.now), 9),
             int(self.sim.vehicle.position),
             self.sim.vehicle.target_node,
-            round(float(self.sim.vehicle.remaining_time), 9),
+            round(
+                float(
+                    self.sim.vehicle.planned_remaining_time(
+                        self.sim.now, self.sim.network
+                    )
+                ),
+                9,
+            ),
+            int(getattr(self.sim, "traffic_state_version", 0)),
             queue_state,
             drone_state,
         )

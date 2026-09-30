@@ -14,6 +14,7 @@ import numpy as np
 from dynamic_patrol_marl.env.road_network import RoadNetwork
 from dynamic_patrol_marl.env.task_generator import Task
 from dynamic_patrol_marl.env.drone import Drone
+from dynamic_patrol_marl.utils.operation_times import planning_operation_time_s
 
 
 @dataclass
@@ -38,6 +39,7 @@ class Sortie:
     battery_at_eta: float = 0.0
     base_feasible: bool = True
     insertion_evaluation: Optional[Dict[str, Any]] = None
+    planned_launch_time_s: float = 0.0
 
     def to_dict(self) -> Dict:
         d = asdict(self)
@@ -57,6 +59,7 @@ class SortieGenerator:
         self.fly_power = float(self.agent_cfg.get("drone_fly_power", 1.0))
         self.hover_power = float(self.agent_cfg.get("drone_hover_power", 0.65))
         self.service_power = float(self.agent_cfg.get("drone_service_power", 0.85))
+        self.planned_launch_time_s = planning_operation_time_s(cfg, "launch")
         self.flight_cfg = dict(cfg.get("uav_flight", {}))
         self.path_cfg = dict(cfg.get("uav_path_planning", {}))
         self.vertical_flight_enabled = bool(self.flight_cfg) and bool(self.path_cfg.get("enabled", False))
@@ -254,8 +257,14 @@ class SortieGenerator:
             ):
                 continue
             distance = min(self._fast_distance(int(launch_node), node) for node in nodes)
-            lower_time = distance / max(self.drone_speed, 1e-9) + self._task_min_service_time(task)
-            lower_energy = lower_time * min(self.fly_power, self.service_power)
+            flight_service_time = (
+                distance / max(self.drone_speed, 1e-9)
+                + self._task_min_service_time(task)
+            )
+            lower_time = self.planned_launch_time_s + flight_service_time
+            # Launch preparation delays task completion but does not consume
+            # onboard UAV energy; only flight/service time belongs here.
+            lower_energy = flight_service_time * min(self.fly_power, self.service_power)
             # Only remove a protected task after a proven optimistic failure.
             if float(now) + lower_time > float(task.deadline) + 1e-9:
                 stats["deadline_pruned_count"] += 1
@@ -358,7 +367,7 @@ class SortieGenerator:
                 # Allocate each A* leg back to execution segments, preserving
                 # service/coverage semantics while replacing all flight ETAs.
                 per_leg = list(precise.segment_results or [])
-                rebuilt=[]; elapsed=energy=0.0; arrivals={}; leg_i=0
+                rebuilt=[]; elapsed=float(getattr(sortie, "planned_launch_time_s", self.planned_launch_time_s)); energy=0.0; arrivals={}; leg_i=0
                 for source in sortie.segments or []:
                     seg=dict(source); kind=str(seg.get("type"))
                     if kind == "horizontal_flight":
@@ -376,7 +385,8 @@ class SortieGenerator:
                 self.last_materialization={"planner_type":"voxel_astar_3d","astar_3d_called":1,"segment_count":len(per_leg),"cache_hit_segments":precise.cache_hit_segments,"cache_miss_segments":precise.cache_miss_segments,"planning_time_ms":1000*precise.planning_time_s,"expanded_nodes":precise.expanded_nodes,"estimated_distance_m":sum(float(s.get("distance_m",0)) for s in legs),"actual_distance_m":precise.total_distance_m,"estimated_flight_time_s":sum(float(s.get("duration",0)) for s in legs),"actual_flight_time_s":precise.flight_time_s,"materialization_success":bool(result.feasible),"failure_stage":None if result.feasible else "after_astar","failure_reason":None if result.feasible else result.reason,"segment_results":per_leg}
                 return result if result.feasible else None
         rebuilt: List[Dict[str, Any]] = []
-        elapsed = energy = 0.0
+        elapsed = float(getattr(sortie, "planned_launch_time_s", self.planned_launch_time_s))
+        energy = 0.0
         task_elapsed: Dict[int, float] = {}
         for segment in sortie.segments or []:
             seg = dict(segment)
@@ -593,7 +603,7 @@ class SortieGenerator:
     ) -> Tuple[Optional[Tuple[float, float, Tuple[int, ...]]], Optional[str]]:
         """Return a conservative no-A* lower bound for an ordered task prefix."""
         current_nodes: Tuple[int, ...] = (int(launch_node),)
-        elapsed = 0.0
+        elapsed = float(self.planned_launch_time_s)
         energy = 0.0
         speed = self._flight_parameters()["cruise_speed"] if self.vertical_flight_enabled else self.drone_speed
         minimum_power = min(self.fly_power, self.service_power)
@@ -986,7 +996,7 @@ class SortieGenerator:
                 False,
             )
         current = int(launch_node)
-        elapsed = 0.0
+        elapsed = float(self.planned_launch_time_s)
         energy = 0.0
         flight = self._flight_parameters()
         if self.vertical_flight_enabled:
@@ -1136,4 +1146,5 @@ class SortieGenerator:
             flight_service_energy=flight_service_energy,
             battery_at_eta=battery_at_eta,
             base_feasible=bool(base_feasible),
+            planned_launch_time_s=float(self.planned_launch_time_s),
         )

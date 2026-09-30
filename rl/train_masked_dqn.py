@@ -53,6 +53,24 @@ STAGE5_EVAL_METRICS = (
     "drone_wait_time_s",
     "vehicle_wait_time_s",
     "mean_uav_recovery_wait_s",
+    "p95_uav_recovery_wait_s",
+    "tasks_per_hour",
+    "num_sorties",
+    "total_uav_hover_time_s",
+    "total_launch_service_time_s",
+    "mean_actual_launch_time_s",
+    "mean_actual_recovery_time_s",
+    "planning_launch_time_s",
+    "planning_recovery_time_s",
+    "total_recovery_service_time_s",
+    "recovery_contention_rate",
+    "non_append_rate",
+    "mean_insertion_displacement",
+    "mean_counterfactual_gain",
+    "locked_queue_rate",
+    "no_feasible_insertion_rate",
+    "dynamic_insertion_computation_time_ms",
+    "recovery_attempts",
     "queue_occupancy_time_s",
     "route_change_count",
     "route_reversal_count",
@@ -166,9 +184,24 @@ def _safe_correlation(left: List[float], right: List[float], *, ranked: bool = F
     y = pd.Series(right, dtype=float)
     if ranked:
         x, y = x.rank(method="average"), y.rank(method="average")
-    if x.nunique(dropna=True) < 2 or y.nunique(dropna=True) < 2:
+    x_values = x.to_numpy(dtype=float)
+    y_values = y.to_numpy(dtype=float)
+    finite = np.isfinite(x_values) & np.isfinite(y_values)
+    x_values = x_values[finite]
+    y_values = y_values[finite]
+    if x_values.size < 2:
         return float("nan")
-    return float(x.corr(y))
+    x_centered = x_values - float(x_values.mean())
+    y_centered = y_values - float(y_values.mean())
+    x_ss = float(np.sum(x_centered * x_centered))
+    y_ss = float(np.sum(y_centered * y_centered))
+    denominator = float(np.sqrt(x_ss * y_ss))
+    if denominator <= 0.0 or not np.isfinite(denominator):
+        return float("nan")
+    # Avoid pandas.Series.corr/np.corrcoef here.  In the Windows gym
+    # environment that BLAS-backed path lazily loads a second libiomp5md.dll
+    # after PyTorch and aborts otherwise-complete long training runs.
+    return float(np.sum(x_centered * y_centered) / denominator)
 
 
 def stage5_event_categories(event_types: str, *, instantaneous_dispatch: bool = False) -> List[str]:
@@ -205,6 +238,7 @@ def validate_resume_checkpoint(
     expected_action_dim: int,
     expected_candidate_dim: int,
     expected_decision_mode: str,
+    expected_q_network_architecture: str,
     current_reward_metadata: Dict,
 ) -> None:
     if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
@@ -223,6 +257,12 @@ def validate_resume_checkpoint(
     )
     if actual != expected:
         raise ValueError(f"resume checkpoint/environment mismatch: checkpoint={actual}, environment={expected}")
+    saved_architecture = str(checkpoint.get("q_network_architecture", "candidate_aware"))
+    if saved_architecture != str(expected_q_network_architecture):
+        raise ValueError(
+            "resume checkpoint Q-network architecture mismatch: "
+            f"checkpoint={saved_architecture} current={expected_q_network_architecture}"
+        )
     saved_reward = dict(checkpoint.get("reward_metadata", {}) or {})
     if not saved_reward.get("signature"):
         raise ValueError("resume checkpoint has no reward configuration signature")
@@ -502,6 +542,30 @@ def write_train_scalars(writer, row: Dict, step: int) -> None:
             writer.add_scalar(f"train/{name}", float(value), step)
 
 
+def persist_training_curve(run_dir: Path, training_rows: List[Dict]) -> None:
+    """Atomically persist completed-episode records for interruption-safe resumes."""
+    curve_path = run_dir / "training_curve.csv"
+    temporary_path = curve_path.with_name(f"{curve_path.name}.tmp")
+    pd.DataFrame(training_rows).to_csv(temporary_path, index=False)
+    temporary_path.replace(curve_path)
+
+
+def load_persisted_training_rows(run_dir: Path, resume_step: int) -> List[Dict]:
+    """Return only completed records at or before a checkpoint being resumed."""
+    curve_path = run_dir / "training_curve.csv"
+    if not curve_path.exists():
+        return []
+    try:
+        history = pd.read_csv(curve_path)
+    except (OSError, pd.errors.EmptyDataError) as exc:
+        raise RuntimeError(f"Cannot read persisted training curve: {curve_path}") from exc
+    if "step" not in history.columns:
+        raise ValueError(f"Persisted training curve has no step column: {curve_path}")
+    steps = pd.to_numeric(history["step"], errors="coerce")
+    history = history.loc[steps.notna() & (steps <= int(resume_step))].copy()
+    return history.to_dict("records")
+
+
 @torch.no_grad()
 def evaluate_policy(
     cfg: Dict,
@@ -599,6 +663,7 @@ def save_outputs(
     reward_metadata: Dict | None = None,
     resume_from: str = "",
     wall_clock_time_s: float = 0.0,
+    q_network_architecture: str = "candidate_aware",
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -620,6 +685,7 @@ def save_outputs(
             "obs_dim": int(obs_dim),
             "action_dim": int(action_dim),
             "candidate_dim": int(hp.candidate_dim),
+            "q_network_architecture": str(q_network_architecture),
             "replay_config": dict(replay_config or {}),
             "decision_mode": str(decision_mode),
             "feature_schema": dict(feature_schema or {}),
@@ -642,6 +708,7 @@ def save_outputs(
         "timesteps": int(total_timesteps),
         "obs_dim": int(obs_dim),
         "action_dim": int(action_dim),
+        "q_network_architecture": str(q_network_architecture),
         "model_path": str(model_path),
         "run_dir": str(run_dir),
         "tensorboard_log_dir": str(tensorboard_log_dir) if tensorboard_log_dir is not None else "",
@@ -693,6 +760,7 @@ def save_intermediate_checkpoint(
     reward_metadata: Dict,
     feature_schema: Dict,
     hyperparams: DQNHyperParams,
+    q_network_architecture: str = "candidate_aware",
 ) -> Path:
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -705,6 +773,7 @@ def save_intermediate_checkpoint(
             "obs_dim": int(obs_dim),
             "action_dim": int(action_dim),
             "candidate_dim": int(candidate_dim),
+            "q_network_architecture": str(q_network_architecture),
             "decision_mode": str(decision_mode),
             "feature_schema": dict(feature_schema),
             "reward_metadata": dict(reward_metadata),
@@ -764,6 +833,7 @@ def train_masked_dqn(
     progress_path = run_dir / "progress.json"
     progress_started_at = perf_counter()
     gradient_updates = 0
+    resume_step = 0
 
     def write_progress(step_value: int, status: str) -> None:
         progress_path.write_text(
@@ -782,7 +852,6 @@ def train_masked_dqn(
             encoding="utf-8",
         )
 
-    write_progress(0, "initializing")
     tensorboard_log_dir = tensorboard_dir / run_name if tensorboard_dir is not None else out_dir / "tensorboard" / run_name
     writer = None
     if enable_tensorboard:
@@ -973,8 +1042,34 @@ def train_masked_dqn(
     if action_dim != expected_action_dim:
         raise ValueError(f"action_dim mismatch: env={action_dim}, expected={expected_action_dim}")
 
-    online_net = make_q_network(algo, obs_dim, action_dim, candidate_dim=hp.candidate_dim).to(device)
-    target_net = make_q_network(algo, obs_dim, action_dim, candidate_dim=hp.candidate_dim).to(device)
+    q_network_architecture = str(
+        cfg.get("rl", {}).get("q_network_architecture", "candidate_aware")
+    ).lower()
+    candidate_features_enabled = bool(
+        cfg.get("ablation", {}).get("candidate_sortie_features", True)
+    )
+    if q_network_architecture == "state_only":
+        if env.decision_mode != "joint_plan":
+            raise ValueError("state_only Q-network architecture requires decision_mode: joint_plan")
+        if candidate_features_enabled:
+            raise ValueError(
+                "state_only Q-network architecture requires "
+                "ablation.candidate_sortie_features: false"
+            )
+    online_net = make_q_network(
+        algo,
+        obs_dim,
+        action_dim,
+        candidate_dim=hp.candidate_dim,
+        architecture=q_network_architecture,
+    ).to(device)
+    target_net = make_q_network(
+        algo,
+        obs_dim,
+        action_dim,
+        candidate_dim=hp.candidate_dim,
+        architecture=q_network_architecture,
+    ).to(device)
     target_net.load_state_dict(online_net.state_dict())
     target_net.eval()
     optimizer = torch.optim.Adam(online_net.parameters(), lr=hp.lr)
@@ -994,8 +1089,18 @@ def train_masked_dqn(
             expected_action_dim=action_dim,
             expected_candidate_dim=int(hp.candidate_dim),
             expected_decision_mode=env.decision_mode,
+            expected_q_network_architecture=q_network_architecture,
             current_reward_metadata=current_reward_metadata,
         )
+        try:
+            resume_step = int(checkpoint["timesteps"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("resume checkpoint has no valid timestep") from exc
+        if resume_step < 0 or resume_step >= effective_timesteps:
+            raise ValueError(
+                "resume checkpoint timestep must be smaller than the requested total: "
+                f"checkpoint={resume_step}, requested={effective_timesteps}"
+            )
         online_net.load_state_dict(checkpoint["model_state_dict"])
         target_net.load_state_dict(online_net.state_dict())
         if checkpoint.get("optimizer_state_dict"):
@@ -1033,7 +1138,13 @@ def train_masked_dqn(
             **replay_kwargs,
         )
 
-    training_rows: List[Dict] = []
+    write_progress(resume_step, "resuming" if resolved_resume_from else "initializing")
+
+    training_rows: List[Dict] = (
+        load_persisted_training_rows(run_dir, resume_step)
+        if resolved_resume_from
+        else []
+    )
     eval_rows: List[Dict] = []
     final_evaluation_transition_rows: List[Dict] = []
     final_evaluation_route_event_rows: List[Dict] = []
@@ -1041,7 +1152,13 @@ def train_masked_dqn(
     episode_reward = 0.0
     episode_steps = 0
     episode_replay_transition_count = 0
-    episode_idx = 0
+    if training_rows:
+        persisted_episodes = pd.to_numeric(
+            pd.DataFrame(training_rows).get("episode"), errors="coerce"
+        ).dropna()
+        episode_idx = int(persisted_episodes.max()) + 1 if not persisted_episodes.empty else len(training_rows)
+    else:
+        episode_idx = 0
     latest_loss = np.nan
     gradient_updates = 0
     training_simulated_seconds = 0.0
@@ -1083,16 +1200,19 @@ def train_masked_dqn(
     training_started_at = perf_counter()
     stage_end_steps = np.cumsum([int(stage.timesteps) for stage in stages]).tolist()
     current_stage_idx = 0
+    while current_stage_idx + 1 < len(stage_end_steps) and resume_step >= stage_end_steps[current_stage_idx]:
+        current_stage_idx += 1
     scheduler.set_stage(current_stage_idx)
     episode_wall_started = perf_counter()
     if max_episodes == 1:
         print("EPISODE_STARTED", flush=True)
     print(
         f"DQN seed_mode={resolved_seed_mode}; mask_mode={'masked' if action_masking else 'unmasked'}; "
-        f"stage 1/{len(stages)} {stages[0].name}, seeds={stages[0].seed_pool}, timesteps={stages[0].timesteps}"
+        f"stage {current_stage_idx + 1}/{len(stages)} {stages[current_stage_idx].name}, "
+        f"seeds={stages[current_stage_idx].seed_pool}, timesteps={stages[current_stage_idx].timesteps}"
     )
 
-    for step in range(1, effective_timesteps + 1):
+    for step in range(resume_step + 1, effective_timesteps + 1):
         while current_stage_idx + 1 < len(stage_end_steps) and step > stage_end_steps[current_stage_idx]:
             current_stage_idx += 1
             scheduler.set_stage(current_stage_idx)
@@ -1298,6 +1418,7 @@ def train_masked_dqn(
                     else {}
                 ),
                 hyperparams=hp,
+                q_network_architecture=q_network_architecture,
             )
             add_phase("checkpoint_time", perf_counter() - checkpoint_started)
 
@@ -1343,6 +1464,7 @@ def train_masked_dqn(
                 logging_started = perf_counter()
                 write_train_scalars(writer, row, step)
                 add_phase("logging_time", perf_counter() - logging_started)
+            persist_training_curve(run_dir, training_rows)
             if timing_enabled:
                 episode_timing_rows.append({
                     "episode": int(episode_idx), "episode_reward": float(episode_reward),
@@ -1506,6 +1628,7 @@ def train_masked_dqn(
         reward_metadata=current_reward_metadata,
         resume_from=resolved_resume_from,
         wall_clock_time_s=wall_clock_time_s,
+        q_network_architecture=q_network_architecture,
     )
     pd.DataFrame(final_evaluation_transition_rows).to_csv(
         run_dir / "evaluation_transition_audit.csv",

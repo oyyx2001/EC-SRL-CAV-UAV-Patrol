@@ -260,7 +260,11 @@ class JointPlanGenerator:
             (int(task.id), str(task.status), task.assigned_to)
             for task in self.sim.tasks
         )
-        return (self.sim.ground_controller.state_fingerprint(), tasks)
+        return (
+            self.sim.ground_controller.state_fingerprint(),
+            int(getattr(self.sim, "traffic_state_version", 0)),
+            tasks,
+        )
 
     def schedule_versions(self) -> Tuple[int, ...]:
         return (
@@ -749,8 +753,13 @@ class JointPlanGenerator:
             "queue": deepcopy(sim.recovery_queue),
             "recovery_version": int(sim.recovery_schedule_version),
             "rng": deepcopy(sim.rng.bit_generator.state),
+            "launch_time_rng": deepcopy(sim.launch_time_rng.bit_generator.state),
+            "recovery_time_rng": deepcopy(sim.recovery_time_rng.bit_generator.state),
             "event_log": deepcopy(sim.event_log), "sortie_log": deepcopy(sim.sortie_log),
             "insertion_log": deepcopy(sim.insertion_log),
+            "operation_time_log": deepcopy(sim.operation_time_log),
+            "launch_duration_samples_s": deepcopy(sim.launch_duration_samples_s),
+            "recovery_duration_samples_s": deepcopy(sim.recovery_duration_samples_s),
             "controller": {
                 key: deepcopy(getattr(controller, key)) for key in (
                     "action_log", "candidate_log", "route_change_log", "recovery_schedule_log",
@@ -770,9 +779,14 @@ class JointPlanGenerator:
         sim.recovery_queue[:] = snapshot["queue"]
         sim.recovery_schedule_version = snapshot["recovery_version"]
         sim.rng.bit_generator.state = snapshot["rng"]
+        sim.launch_time_rng.bit_generator.state = snapshot["launch_time_rng"]
+        sim.recovery_time_rng.bit_generator.state = snapshot["recovery_time_rng"]
         sim.event_log[:] = snapshot["event_log"]
         sim.sortie_log[:] = snapshot["sortie_log"]
         sim.insertion_log[:] = snapshot["insertion_log"]
+        sim.operation_time_log[:] = snapshot["operation_time_log"]
+        sim.launch_duration_samples_s[:] = snapshot["launch_duration_samples_s"]
+        sim.recovery_duration_samples_s[:] = snapshot["recovery_duration_samples_s"]
         for key, value in snapshot["controller"].items():
             setattr(sim.ground_controller, key, value)
 
@@ -839,7 +853,18 @@ class JointPlanGenerator:
                 else:
                     evaluation = plan.insertion_evaluation or {}
                 entry = dict(evaluation["entry"])
-                index = int(plan.insertion_index)
+                # The post-materialization recovery evaluation is authoritative:
+                # the realized flight path can change ETA and therefore the best
+                # legal queue position.  Never commit the stale candidate-stage
+                # index against a schedule computed for another position.
+                index = int(evaluation["best_index"])
+                plan.insertion_index = index
+                plan.insertion_evaluation = evaluation
+                if not self.sim.dynamic_insertion_enabled and index != len(self.sim.recovery_queue):
+                    raise RuntimeError("fifo_non_append_insertion")
+                selected_index = evaluation.get("diagnostics", {}).get("selected_index")
+                if selected_index is not None and int(selected_index) != index:
+                    raise RuntimeError("recovery_insertion_index_mismatch")
                 if index < 0 or index > len(self.sim.recovery_queue):
                     raise RuntimeError("insertion_index_invalid")
                 locked = self.sim.recovery_scheduler.locked_prefix_length(self.sim.recovery_queue)
@@ -857,11 +882,24 @@ class JointPlanGenerator:
                     raise RuntimeError("injected_failure_after_recovery_insertion")
                 self.sim._record_insertion_attempt(sortie, evaluation)
                 self.sim.task_pool.mark_assigned(sortie.task_ids, drone.id, self.sim.now)
-                drone.assign_sortie(sortie, self.sim.now)
+                actual_launch = self.sim.begin_sortie_launch(drone, sortie, self.sim.now)
                 plan.sortie = sortie
-                self.sim.sortie_log.append({"time": self.sim.now, **sortie.to_dict()})
+                self.sim.sortie_log.append(
+                    {
+                        "time": self.sim.now,
+                        **sortie.to_dict(),
+                        "planned_launch_time_s": float(getattr(sortie, "planned_launch_time_s", self.sim.planning_launch_time_s)),
+                        "actual_launch_time_s": float(actual_launch),
+                        "planned_recovery_time_s": float(self.sim.planning_recovery_time_s),
+                    }
+                )
                 self.sim.event_log.append({"time": self.sim.now, "event": "launch", "agent": drone.id, "node": sortie.launch_node, "tasks": ";".join(map(str, sortie.task_ids))})
-                self.sim.event_log.append({"time": self.sim.now, "event": "recovery_queue_insert", "agent": drone.id, "node": int(sortie.recovery_node), "queue_position": index, "tasks": ";".join(map(str, sortie.task_ids))})
+                recovery_event = (
+                    "recovery_queue_insert"
+                    if self.sim.dynamic_insertion_enabled
+                    else "recovery_queue_append"
+                )
+                self.sim.event_log.append({"time": self.sim.now, "event": recovery_event, "agent": drone.id, "node": int(sortie.recovery_node), "queue_position": index, "tasks": ";".join(map(str, sortie.task_ids))})
                 if plan.ground_candidate.action_type == "keep_route" and not plan.ground_already_committed:
                     self.sim._set_vehicle_next_recovery_target()
             self.selected_type_counts[plan.plan_type] += 1

@@ -16,6 +16,7 @@ from .vehicle import Vehicle
 from .drone import Drone
 from .recovery_scheduler import RecoveryInsertionScheduler
 from .cav_controller import ActiveCAVController
+from .traffic import TimeVaryingTraffic
 from .xinjiekou_adapter import (
     build_direct_edge_task_stream,
     build_periodic_task_stream,
@@ -24,6 +25,10 @@ from .xinjiekou_adapter import (
 from dynamic_patrol_marl.planner.sortie_generator import Sortie, SortieGenerator
 from dynamic_patrol_marl.planner.joint_plan import JointPlanGenerator
 from dynamic_patrol_marl.utils.metrics import EpisodeMetrics, summarize_task_metrics
+from dynamic_patrol_marl.utils.operation_times import (
+    planning_operation_time_s,
+    sample_actual_operation_time_s,
+)
 
 
 PolicyFn = Callable[["Simulator", List[Sortie]], Union[Sequence[Sortie], Sortie, None]]
@@ -44,6 +49,35 @@ class Simulator:
         self.cfg = cfg
         self.seed = int(cfg["project"].get("seed", 42) if seed is None else seed)
         self.rng = np.random.default_rng(self.seed)
+        operation_seed = np.random.SeedSequence([self.seed, 0x4F5054494D45])
+        launch_seed, recovery_seed = operation_seed.spawn(2)
+        self.launch_time_rng = np.random.default_rng(launch_seed)
+        self.recovery_time_rng = np.random.default_rng(recovery_seed)
+        # Keep the historical operation-time RNG streams unchanged.  The
+        # optional execution perturbation has a separate stream so enabling
+        # it cannot shift nominal launch/recovery draws or task generation.
+        execution_cfg = dict(cfg.get("operational_execution_uncertainty", {}) or {})
+        recovery_execution_cfg = dict(execution_cfg.get("recovery_time", {}) or {})
+        self.recovery_execution_uncertainty_enabled = bool(
+            execution_cfg.get("enabled", False) and recovery_execution_cfg.get("enabled", False)
+        )
+        self.recovery_execution_uncertainty_distribution = str(
+            recovery_execution_cfg.get("distribution", "uniform")
+        ).lower()
+        self.recovery_execution_delta = float(recovery_execution_cfg.get("delta", 0.0))
+        if not 0.0 <= self.recovery_execution_delta < 1.0:
+            raise ValueError("operational_execution_uncertainty.recovery_time.delta must be in [0, 1)")
+        if self.recovery_execution_uncertainty_distribution != "uniform":
+            raise ValueError("Only uniform recovery execution uncertainty is supported")
+        self.recovery_execution_rng = np.random.default_rng(
+            np.random.SeedSequence([self.seed, 0x524543555254])
+        )
+        self.recovery_execution_uncertainty_log: List[Dict[str, Any]] = []
+        self.planning_launch_time_s = planning_operation_time_s(cfg, "launch")
+        self.planning_recovery_time_s = planning_operation_time_s(cfg, "recovery")
+        self.launch_duration_samples_s: List[float] = []
+        self.recovery_duration_samples_s: List[float] = []
+        self.operation_time_log: List[Dict[str, Any]] = []
         self.scenario = scenario
         self.network = RoadNetwork(cfg)
         simulation_cfg = cfg.get("simulation", {})
@@ -125,6 +159,13 @@ class Simulator:
             raise ValueError(f"Unknown time mode: {self.time_mode}")
         self.event_driven = self.time_mode == "event_driven"
         self.event_log: List[Dict[str, Any]] = []
+        self.traffic_update_log: List[Dict[str, Any]] = []
+        self.traffic = TimeVaryingTraffic(self.network, cfg, self.seed)
+        # Vehicle keeps the historical ``network``-only method signatures;
+        # the attached traffic model supplies hidden physical realizations.
+        self.network.traffic = self.traffic
+        self.traffic_state_version = 0
+        self.update_traffic(0.0)
         self.sortie_log: List[Dict[str, Any]] = []
         self.recovery_queue: List[Dict[str, Any]] = []
         # Time integral of the actual recovery-queue occupancy.  It is kept
@@ -144,6 +185,7 @@ class Simulator:
         self.recovery_scheduler = RecoveryInsertionScheduler(self)
         self.insertion_log: List[Dict[str, Any]] = []
         self.recovery_wait_records: List[float] = []
+        self.recovery_service_time_s = 0.0
         self.insertion_evaluation_count = 0
         self.no_feasible_insertion_count = 0
         self.infeasible_recoveries = 0
@@ -171,6 +213,31 @@ class Simulator:
     def reset(self) -> None:
         self.__init__(self.cfg, self.seed, self.scenario)
 
+    def update_traffic(self, event_time: float) -> bool:
+        """Apply one exogenous traffic epoch and refresh physical route timing."""
+        snapshot = self.traffic.update(float(event_time))
+        if snapshot is None:
+            return False
+        self.traffic_state_version = int(self.traffic.revision)
+        self.vehicle.refresh_actual_remaining_time(
+            self.network,
+            now=float(event_time),
+            resample_current=bool(self.traffic.staged_speed),
+        )
+        record = {"seed": int(self.seed), **snapshot.to_dict()}
+        self.traffic_update_log.append(record)
+        self.event_log.append(
+            {
+                "time": float(event_time),
+                "event": "traffic_update",
+                "agent": "traffic",
+                "node": "",
+                "tasks": "",
+                **record,
+            }
+        )
+        return True
+
     def active_drones(self) -> List[Drone]:
         return [d for d in self.drones if not d.is_idle()]
 
@@ -178,6 +245,74 @@ class Simulator:
         if not self.vehicle.at_intersection:
             return []
         return [d for d in self.drones if d.is_idle() and d.position == self.vehicle.position]
+
+    def sample_actual_operation_time_s(self, operation: str) -> float:
+        rng = self.launch_time_rng if str(operation).lower() == "launch" else self.recovery_time_rng
+        return sample_actual_operation_time_s(self.cfg, operation, rng)
+
+    def sample_actual_recovery_execution_time(self, start_time: Optional[float] = None) -> Tuple[float, float, float]:
+        """Sample one physical recovery duration and its optional multiplier.
+
+        The existing truncated-normal realization is retained as the base
+        duration.  The new uncertainty analysis adds one uniform multiplier
+        sampled at recovery start and held for the complete service interval.
+        Thus delta=0 is exactly the historical nominal evaluation.
+        """
+        base_duration = float(self.sample_actual_operation_time_s("recovery"))
+        if self.recovery_execution_uncertainty_enabled and self.recovery_execution_delta > 0.0:
+            multiplier = float(
+                self.recovery_execution_rng.uniform(
+                    1.0 - self.recovery_execution_delta,
+                    1.0 + self.recovery_execution_delta,
+                )
+            )
+        else:
+            multiplier = 1.0
+        actual_duration = max(0.0, base_duration * multiplier)
+        self.recovery_execution_uncertainty_log.append(
+            {
+                "time": float(self.now if start_time is None else start_time),
+                "base_actual_duration_s": base_duration,
+                "actual_duration_s": actual_duration,
+                "multiplier": multiplier,
+                "delta": float(self.recovery_execution_delta),
+                "enabled": bool(self.recovery_execution_uncertainty_enabled),
+            }
+        )
+        return actual_duration, base_duration, multiplier
+
+    def begin_sortie_launch(self, drone: Drone, sortie: Sortie, now: float) -> float:
+        """Commit an unobserved launch-time draw after the plan is selected."""
+        actual = float(self.sample_actual_operation_time_s("launch"))
+        planned = float(getattr(sortie, "planned_launch_time_s", self.planning_launch_time_s))
+        setattr(sortie, "actual_launch_time_s", actual)
+        drone.assign_sortie(sortie, now)
+        self.launch_duration_samples_s.append(actual)
+        self.operation_time_log.append(
+            {
+                "time": float(now),
+                "operation": "launch",
+                "agent": str(drone.id),
+                "planned_duration_s": planned,
+                "actual_duration_s": actual,
+                "minimum_s": float(self.cfg.get("operational_time_uncertainty", {}).get("launch", {}).get("min_s", actual)),
+                "maximum_s": float(self.cfg.get("operational_time_uncertainty", {}).get("launch", {}).get("max_s", actual)),
+            }
+        )
+        if actual > 1e-9:
+            self.vehicle.begin_operation_hold(float(now) + actual, float(now) + planned, float(now))
+            self.event_log.append(
+                {
+                    "time": float(now),
+                    "event": "launch_service_start",
+                    "agent": str(drone.id),
+                    "node": int(sortie.launch_node),
+                    "tasks": ";".join(map(str, sortie.task_ids)),
+                    "planned_duration_s": planned,
+                    "actual_duration_s": actual,
+                }
+            )
+        return actual
 
     def get_candidates(self, no_multitask: bool = False, no_priority: bool = False) -> List[Sortie]:
         self.task_pool.update_release_and_expiry(self.now)
@@ -324,8 +459,16 @@ class Simulator:
             else:
                 self._append_fifo_entry(s, evaluation)
             self.task_pool.mark_assigned(s.task_ids, drone.id, self.now)
-            drone.assign_sortie(s, self.now)
-            self.sortie_log.append({"time": self.now, **s.to_dict()})
+            actual_launch = self.begin_sortie_launch(drone, s, self.now)
+            self.sortie_log.append(
+                {
+                    "time": self.now,
+                    **s.to_dict(),
+                    "planned_launch_time_s": float(getattr(s, "planned_launch_time_s", self.planning_launch_time_s)),
+                    "actual_launch_time_s": float(actual_launch),
+                    "planned_recovery_time_s": float(self.planning_recovery_time_s),
+                }
+            )
             self.event_log.append({"time": self.now, "event": "launch", "agent": drone.id, "node": s.launch_node, "tasks": ";".join(map(str, s.task_ids))})
             self.event_log.append(
                 {
@@ -392,6 +535,7 @@ class Simulator:
             # ``now`` and the episode never advances.
             for drone in self.drones:
                 self._advance_drone(drone, 0.0, self.now)
+            self._complete_recoveries(self.now)
             self._recover_waiting_drones(self.now)
             return
         start = self.now
@@ -414,6 +558,7 @@ class Simulator:
         if (
             self.vehicle.is_idle()
             and not self.vehicle.is_waiting(self.now)
+            and not self.vehicle.is_operationally_held(self.now)
             and front is not None
             and int(front["recovery_node"]) == self.vehicle.position
             and self.get_drone(str(front["drone_id"])).status != "idle"
@@ -432,6 +577,7 @@ class Simulator:
         for arrival_time, node in self.last_step_vehicle_arrivals:
             self.event_log.append({"time": arrival_time, "event": "vehicle_arrive", "agent": self.vehicle.id, "node": node, "tasks": ""})
         event_time = start + dt if self.event_driven else self.now
+        self._complete_recoveries(event_time)
         if arrived:
             self._recover_waiting_drones(event_time)
         # Recover if vehicle is already at a waiting drone's recovery point.
@@ -447,14 +593,43 @@ class Simulator:
     def _advance_drone(self, drone: Drone, dt: float, step_start: float) -> None:
         if drone.status == "idle":
             return
+        remain = max(0.0, float(dt))
+        local_time = float(step_start)
+        if drone.status == "launching":
+            used = min(remain, max(0.0, float(drone.launch_remaining_s)))
+            drone.launch_remaining_s = max(0.0, float(drone.launch_remaining_s) - used)
+            remain -= used
+            local_time += used
+            if drone.launch_remaining_s > 1e-9:
+                return
+            drone.status = "flying"
+            drone.segment_remaining = (
+                float(drone.sortie.segments[0]["duration"])
+                if drone.sortie is not None and drone.sortie.segments
+                else 0.0
+            )
+            drone.log.append((local_time, "takeoff", int(drone.position)))
+            self.event_log.append(
+                {
+                    "time": local_time,
+                    "event": "uav_takeoff",
+                    "agent": drone.id,
+                    "node": int(drone.position),
+                    "tasks": ";".join(map(str, drone.sortie.task_ids if drone.sortie is not None else [])),
+                    "actual_launch_duration_s": float(drone.actual_launch_duration_s),
+                }
+            )
         if drone.status == "waiting_recovery":
-            self._consume(drone, dt, "hover")
-            drone.wait_time += dt
+            self._consume(drone, remain, "hover")
+            drone.wait_time += remain
+            return
+        if drone.status == "recovering":
+            used = min(remain, max(0.0, float(drone.recovery_remaining_s)))
+            drone.recovery_remaining_s = max(0.0, float(drone.recovery_remaining_s) - used)
+            self.recovery_service_time_s += used
             return
         if drone.status != "flying" or drone.sortie is None:
             return
-        remain = max(0.0, float(dt))
-        local_time = step_start
         instantaneous_transitions = 0
         while drone.status == "flying":
             if drone.segment_index >= len(drone.sortie.segments):
@@ -568,7 +743,7 @@ class Simulator:
             entry["status"] = "returning"
             entry["recovery_arrival_time"] = float(t)
         if self._front_queue_matches(drone.id, rec) and self.vehicle.position == rec and self.vehicle.is_idle():
-            self._recover_drone(drone, t)
+            self._start_recovery(drone, t)
         else:
             drone.status = "waiting_recovery"
             drone.log.append((t, "waiting_recovery", rec))
@@ -581,8 +756,91 @@ class Simulator:
         drone = self.get_drone(str(front["drone_id"]))
         rec = int(front["recovery_node"])
         if drone.status == "waiting_recovery" and drone.position == self.vehicle.position == rec:
-            front["status"] = "recovering"
-            self._recover_drone(drone, self.now if event_time is None else float(event_time))
+            self._start_recovery(drone, self.now if event_time is None else float(event_time))
+
+    def _start_recovery(self, drone: Drone, t: float) -> None:
+        """Start one exclusive CAV-UAV docking/loading service interval.
+
+        The scheduler already reserves ``recovery_duration`` in the predicted
+        queue.  This method realizes the same duration physically: the CAV is
+        held at the rendezvous node and the UAV cannot be dispatched until the
+        service interval completes.
+        """
+        rec = int(drone.position)
+        entry = self._queue_entry_for_drone(drone.id)
+        if entry is None or not self._front_queue_matches(drone.id, rec):
+            return
+        if int(self.vehicle.position) != rec or not self.vehicle.is_idle():
+            return
+
+        if self.vehicle.is_waiting(t) or self.vehicle.wait_until is not None:
+            self.vehicle.end_wait()
+
+        arrival_time = entry.get("recovery_arrival_time")
+        actual_wait = max(0.0, float(t) - float(arrival_time)) if arrival_time is not None else 0.0
+        self.recovery_wait_records.append(actual_wait)
+        self.ground_controller.record_recovery(
+            str(entry.get("sortie_id", entry.get("drone_id", ""))), actual_wait
+        )
+
+        planned_duration = max(
+            0.0,
+            float(entry.get("recovery_duration", self.planning_recovery_time_s)),
+        )
+        if "actual_recovery_duration_s" in entry:
+            duration = float(entry["actual_recovery_duration_s"])
+            base_duration = duration
+            recovery_uncertainty_multiplier = 1.0
+        else:
+            duration, base_duration, recovery_uncertainty_multiplier = self.sample_actual_recovery_execution_time(t)
+        duration = max(0.0, duration)
+        entry["planned_recovery_duration_s"] = planned_duration
+        entry["actual_recovery_duration_s"] = duration
+        entry["base_actual_recovery_duration_s"] = float(base_duration)
+        entry["recovery_execution_uncertainty_multiplier"] = float(recovery_uncertainty_multiplier)
+        self.recovery_duration_samples_s.append(duration)
+        self.operation_time_log.append(
+            {
+                "time": float(t),
+                "operation": "recovery",
+                "agent": str(drone.id),
+                "planned_duration_s": planned_duration,
+                "actual_duration_s": duration,
+                "base_actual_duration_s": float(base_duration),
+                "uncertainty_multiplier": float(recovery_uncertainty_multiplier),
+                "uncertainty_delta": float(self.recovery_execution_delta),
+                "minimum_s": float(self.cfg.get("operational_time_uncertainty", {}).get("recovery", {}).get("min_s", duration)),
+                "maximum_s": float(self.cfg.get("operational_time_uncertainty", {}).get("recovery", {}).get("max_s", duration)),
+            }
+        )
+        entry["status"] = "recovering"
+        entry["recovery_service_start_time"] = float(t)
+        entry["recovery_service_finish_time"] = float(t) + duration
+        drone.status = "recovering"
+        drone.recovery_remaining_s = duration
+        drone.log.append((float(t), "recovery_service_start", rec))
+        self.event_log.append(
+            {
+                "time": float(t),
+                "event": "recovery_service_start",
+                "agent": drone.id,
+                "node": rec,
+                "tasks": ";".join(map(str, entry.get("task_ids", []))),
+                "duration_s": duration,
+                "planned_duration_s": planned_duration,
+                "actual_duration_s": duration,
+            }
+        )
+        if duration <= 1e-9:
+            self._recover_drone(drone, t)
+        else:
+            self.vehicle.begin_wait(float(t) + duration, float(t))
+
+    def _complete_recoveries(self, t: float) -> None:
+        """Complete service intervals that end at this simulation event."""
+        for drone in self.drones:
+            if drone.status == "recovering" and float(drone.recovery_remaining_s) <= 1e-9:
+                self._recover_drone(drone, t)
 
     def _recover_drone(self, drone: Drone, t: float) -> None:
         rec = drone.position
@@ -592,13 +850,17 @@ class Simulator:
             self.vehicle.end_wait()
         entry = self._queue_entry_for_drone(drone.id)
         if entry is not None:
-            arrival_time = entry.get("recovery_arrival_time")
-            actual_wait = max(0.0, float(t) - float(arrival_time)) if arrival_time is not None else 0.0
-            self.recovery_wait_records.append(actual_wait)
-            self.ground_controller.record_recovery(
-                str(entry.get("sortie_id", entry.get("drone_id", ""))), actual_wait
-            )
             entry["status"] = "completed"
+            entry["recovery_service_finish_time"] = float(t)
+            self.event_log.append(
+                {
+                    "time": float(t),
+                    "event": "recovery_service_complete",
+                    "agent": drone.id,
+                    "node": rec,
+                    "tasks": ";".join(map(str, entry.get("task_ids", []))),
+                }
+            )
         drone.reset_after_recovery(rec, t)
         if self.recovery_queue and str(self.recovery_queue[0]["drone_id"]) == drone.id:
             finished = self.recovery_queue.pop(0)
@@ -693,9 +955,15 @@ class Simulator:
         return int(self.vehicle.position)
 
     def recovery_queue_travel_time_s(self) -> float:
+        planned_hold = float(self.vehicle.planned_operation_hold_remaining(self.now))
+        active_route_time = float(
+            self.vehicle.planned_remaining_time(self.now, self.network)
+            if self.vehicle.target_node is not None
+            else 0.0
+        )
         if not self.recovery_queue:
-            return float(self.vehicle.remaining_time if self.vehicle.target_node is not None else 0.0)
-        total = float(self.vehicle.remaining_time if self.vehicle.target_node is not None else 0.0)
+            return planned_hold + active_route_time
+        total = planned_hold + active_route_time
         nodes = [int(x["recovery_node"]) for x in self.recovery_queue]
         start_idx = 0
         if self.vehicle.target_node is None:
@@ -776,6 +1044,14 @@ class Simulator:
             p95_uav_recovery_wait_s=float(np.percentile(self.recovery_wait_records, 95)) if self.recovery_wait_records else 0.0,
             total_uav_hover_time_s=hover_time,
             total_hover_energy=hover_energy,
+            total_launch_service_time_s=float(sum(self.launch_duration_samples_s)),
+            mean_actual_launch_time_s=float(np.mean(self.launch_duration_samples_s)) if self.launch_duration_samples_s else 0.0,
+            mean_actual_recovery_time_s=float(np.mean(self.recovery_duration_samples_s)) if self.recovery_duration_samples_s else 0.0,
+            planning_launch_time_s=float(self.planning_launch_time_s),
+            planning_recovery_time_s=float(self.planning_recovery_time_s),
+            launch_time_sample_count=len(self.launch_duration_samples_s),
+            recovery_time_sample_count=len(self.recovery_duration_samples_s),
+            total_recovery_service_time_s=float(self.recovery_service_time_s),
             mean_cav_waiting_time_s=self.vehicle.wait_time / completed_recoveries if completed_recoveries else 0.0,
             cav_travel_distance_m=float(cav_distance),
             recovery_contention_rate=(sum(int(row.get("queue_length_before", 0)) >= 2 for row in self.insertion_log) / insertion_count) if insertion_count else 0.0,
@@ -807,6 +1083,7 @@ class Simulator:
         pd.DataFrame(self.vehicle.route_log, columns=["time", "node"]).to_csv(out / f"{prefix}_vehicle_route.csv", index=False)
         pd.DataFrame(self.vehicle.route_edge_log, columns=["time", "from_node", "to_node"]).to_csv(out / f"{prefix}_vehicle_edges.csv", index=False)
         pd.DataFrame(self.insertion_log).to_csv(out / f"{prefix}_recovery_insertions.csv", index=False)
+        pd.DataFrame(self.operation_time_log).to_csv(out / f"{prefix}_operation_times.csv", index=False)
         pd.DataFrame(self.ground_controller.action_log).to_csv(out / f"{prefix}_cav_actions.csv", index=False)
         pd.DataFrame(self.sortie_generator.candidate_generation_log).to_csv(
             out / f"{prefix}_candidate_generation_calls.csv", index=False
