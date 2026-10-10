@@ -1,34 +1,17 @@
 # Default Rainbow DQN training
 
-The training entry loads `configs/default_training.yaml` automatically, so the
-default scene is Xinjiekou. Its committed sorties use hidden truncated-normal
-handling times: launch 50--70 s (center 60 s) and recovery 25--35 s (center
-30 s). Planning uses the conservative upper bounds 70 s and 35 s.
+`configs/default_training.yaml` is the canonical Xinjiekou configuration and now records the 300,000 decision-transition training budget used in the manuscript protocol. The default model is candidate-aware Rainbow DQN with 25 action slots, 38 features per candidate, elapsed-time discounting (`gamma=0.99`, reference interval 60 s), NoisyNet exploration after a 1,000-step warm-up, and prioritized replay.
 
-CAV planning uses deterministic stage-mean speeds: 30 km/h for 0--3600 s,
-20 km/h for 3600--7200 s, and 30 km/h for 7200--12600 s. Physical execution
-samples a hidden truncated-normal multiplier (`mean=1`, `std=0.1`, bounds
-`[0.8, 1.2]`) when entering each road edge and resamples the remaining distance
-when a stage boundary is crossed.
+The scene uses a 10,800 s task-release horizon followed by a drain period of up to 1,800 s. Planning uses launch and recovery upper bounds of 70 s and 35 s; execution samples hidden truncated-normal durations in the ranges 50--70 s and 25--35 s. CAV planning uses staged mean speeds of 30 km/h, 20 km/h, and 30 km/h for the three traffic intervals, with a hidden bounded multiplier in [0.8, 1.2].
+
+Run the paper configuration with:
 
 ```powershell
 python -B -m rl.train_masked_dqn `
+  --config configs\default_training.yaml `
   --seed 42 `
-  --max-episodes 30 `
+  --timesteps 300000 `
   --disable-tensorboard
 ```
 
-To train on Baijiahu with the same model, reward, task-generation, and
-time-aware discount settings:
-
-```powershell
-python -B -m rl.train_masked_dqn `
-  --config configs\baijiahu_training.yaml `
-  --seed 42 `
-  --max-episodes 30 `
-  --disable-tensorboard
-```
-
-Each scene configuration supplies its output directory, run name, model name,
-map, and task registry. Command-line options can still override run-specific
-values.
+For a quick smoke test, override `--timesteps 2000` or use `--max-episodes 1`.

@@ -314,7 +314,7 @@ reward:
 
 rl:
   algo: rainbow_dqn
-  timesteps: 100000
+  timesteps: 300000
   run_name: rainbow_default
   model_name: rainbow_dqn_default.pt
   action_masking: true
@@ -327,13 +327,28 @@ rl:
   n_step: 1
   hyperparams:
     candidate_dim: 38
+    lr: 0.0001
     batch_size: 128
     replay_buffer_size: 100000
     learning_starts: 1000
     target_update_interval: 2000
     eval_interval: 10000
     checkpoint_interval: 10000
+    max_grad_norm: 10.0
+    prioritized_replay_alpha: 0.6
+    prioritized_replay_beta_start: 0.4
+    prioritized_replay_beta_final: 1.0
+    prioritized_replay_beta_steps: 200000
+    priority_epsilon: 0.000001
     diagnostic_sample_stride: 1
+
+joint_plan_features:
+  distance_scale_m: 3600.0
+  time_scale_s: 600.0
+  energy_scale: 1800.0
+  task_scale: 10.0
+  clip_low: -5.0
+  clip_high: 5.0
 
 training:
   seed_mode: random
