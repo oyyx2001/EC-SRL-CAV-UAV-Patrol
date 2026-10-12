@@ -1,9 +1,0 @@
-{
-"type": "FeatureCollection",
-"name": "supplementary_launch_nodes",
-"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:EPSG::32650" } },
-"features": [
-{ "type": "Feature", "properties": { "node_id": "ground_node_000967", "key_node_rank": 332, "degree": 1.0, "betweenness": 0.0, "closeness": 0.00054553940274118724, "road_class_score": 0.2, "selection_role": "supplementary_road_coverage", "node_type": "launch_recovery_candidate", "launch_allowed": true, "recovery_allowed": true, "operation_score": 0.018561260173033341, "operation_score_source": "road_coverage_distance", "region": "xinjiekou" }, "geometry": { "type": "Point", "coordinates": [ 667915.592792026815005, 3549002.071388637181371 ] } },
-{ "type": "Feature", "properties": { "node_id": "ground_node_000946", "key_node_rank": 333, "degree": 1.0, "betweenness": 0.0, "closeness": 0.00054556271519558568, "road_class_score": 0.2, "selection_role": "supplementary_road_coverage", "node_type": "launch_recovery_candidate", "launch_allowed": true, "recovery_allowed": true, "operation_score": 0.01856188359024933, "operation_score_source": "road_coverage_distance", "region": "xinjiekou" }, "geometry": { "type": "Point", "coordinates": [ 667935.80744025669992, 3549001.728223036043346 ] } }
-]
-}

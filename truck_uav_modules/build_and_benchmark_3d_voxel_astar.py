@@ -143,7 +143,15 @@ def load_grid_metadata(data_dir: Path) -> Dict[str, dict]:
     result = {}
     for scene in SCENES:
         path = data_dir / "processed_grid_layers" / f"{scene}_grid_metadata.json"
-        result[scene] = json.loads(path.read_text(encoding="utf-8"))
+        if path.is_file():
+            result[scene] = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            # Offline compatibility only: derive the original extent from local
+            # footprints instead of depending on unpublished historical grids.
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import rasterize_building_occupancy as grid_tools
+            buildings = load_and_clean_buildings(data_dir, scene)
+            result[scene] = grid_tools.derive_grid_spec(buildings).metadata()
     return result
 
 
@@ -154,7 +162,15 @@ def load_existing_2d_grid(data_dir: Path, scene: str, layer_m: int) -> np.ndarra
 
 def load_launch_recovery_mapping(data_dir: Path, scene: str) -> pd.DataFrame:
     path = data_dir / "processed_grid_layers_with_launch_recovery" / "launch_recovery_grid_mapping.csv"
-    mapping = pd.read_csv(path)
+    if path.is_file():
+        mapping = pd.read_csv(path)
+    else:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import rasterize_building_occupancy as grid_tools
+        buildings = load_and_clean_buildings(data_dir, scene)
+        grid = grid_tools.derive_grid_spec(buildings)
+        nodes = gpd.read_file(data_dir / scene / "launch_recovery_nodes.geojson")
+        mapping = grid_tools.map_launch_nodes(nodes, grid, scene)
     mapping = mapping[(mapping["scene"].astype(str).str.lower() == scene) & mapping["in_bounds"].astype(bool)].copy()
     required = {"node_id", "row", "col", "node_x", "node_y"}
     missing = required - set(mapping.columns)
@@ -171,6 +187,8 @@ def load_and_clean_buildings(data_dir: Path, scene: str) -> gpd.GeoDataFrame:
     import rasterize_building_occupancy as grid_tools
 
     path = data_dir / scene / ("buildings.geojson" if scene.lower() == "xinjiekou" else "buildings_local.geojson")
+    if not path.is_file():
+        path = data_dir / scene / "buildings.geojson"
     buildings = grid_tools.load_buildings(path)
     buildings = grid_tools.normalize_building_height(grid_tools.clean_building_geometries(buildings))
     return buildings

@@ -61,3 +61,19 @@ truck_uav_modules/data/processed_grid_layers_with_launch_recovery/
 *.tmp
 *.bak
 ~$*
+
+# Only the two reviewed, original-weight releases are publishable.
+!checkpoints/cs_rdqn_case1_xinjiekou.pt
+!checkpoints/cs_rdqn_case2_baijiahu.pt
+
+# Historical experiment helpers remain recoverable locally, not in the release.
+scripts/
+tests/test_ablation*.py
+tests/test_joint_sensitivity*.py
+
+# Geographic inputs/derivatives: redistribution rights are unverified.
+# These rules alone do not untrack files or erase historical commits.
+/data/*
+!/data/README.md
+/truck_uav_modules/data/*
+!/truck_uav_modules/data/README.md

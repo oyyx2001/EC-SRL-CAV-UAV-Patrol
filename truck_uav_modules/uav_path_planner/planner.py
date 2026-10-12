@@ -19,8 +19,13 @@ from shapely import make_valid
 from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
-from ground_network import load_ground_network, shortest_ground_path
-from ground_network.api import DATA_ROOT, REGION_CONFIG
+if "." in (__package__ or ""):
+    # Support normal package imports without changing the legacy runtime route.
+    from ..ground_network import load_ground_network, shortest_ground_path
+    from ..ground_network.api import DATA_ROOT, REGION_CONFIG
+else:
+    from ground_network import load_ground_network, shortest_ground_path
+    from ground_network.api import DATA_ROOT, REGION_CONFIG
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]

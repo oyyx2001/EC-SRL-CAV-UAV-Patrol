@@ -10,7 +10,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from collections import OrderedDict, Counter, defaultdict
 import json, math, time
 import numpy as np
-import build_and_benchmark_3d_voxel_astar as core
+if "." in (__package__ or ""):
+    from .. import build_and_benchmark_3d_voxel_astar as core
+else:
+    import build_and_benchmark_3d_voxel_astar as core
 
 @dataclass
 class UAVPathResult:

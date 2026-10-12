@@ -1,0 +1,67 @@
+{
+  "cases": [
+    "case1_xinjiekou",
+    "case2_baijiahu"
+  ],
+  "seeds": [
+    1000,
+    1001,
+    1002,
+    1003,
+    1004,
+    1005,
+    1006,
+    1007,
+    1008,
+    1009,
+    1010,
+    1011,
+    1012,
+    1013,
+    1014,
+    1015,
+    1016,
+    1017,
+    1018,
+    1019
+  ],
+  "device": "cpu",
+  "source_sha256": "7bb57e283b26f1743d58c295140d31a36185a72f847f1200d4d5d4ab5b435dff",
+  "checkpoint_sha256": {
+    "case1_xinjiekou": "f2d07f011a9ed8926b8e51280ef7b4c7e2643be588ba949fa55a48d9e0f38dd1",
+    "case2_baijiahu": "8953d8632646b9ce06a8f1c2269c3b3d881a8bdc29947eaa3d0722313013ee98"
+  },
+  "asset_sha256": {
+    "case1_xinjiekou": {
+      "data/xinjiekou/edge_task_registry.csv": "fb65162bd39a69a4860566769579bf56b089a10734f59a934cd2074517f30ddb",
+      "truck_uav_modules/data/xinjiekou/buildings.geojson": "288a487020ee0ec4cdc3a496fe6c0299531496f0d437f6a312bde387dc4a0334",
+      "truck_uav_modules/data/xinjiekou/launch_recovery_nodes.geojson": "641f4b5f183a8e141bd4e1a004e47a623e2ce177fa0c58990e40500a49cef1f2",
+      "truck_uav_modules/data/xinjiekou/road_network.graphml": "20f8fa7dd0efbba3d257cdfa2a68d2f39f7f46241277cb3d81fdf4c3c1e93c9d",
+      "truck_uav_modules/data/xinjiekou/voxel_map_3d/metadata.json": "483be0ef56ec7e47c4dc5df4fa26a810ff0b40442f3c0ee6329f21f4d43dbe25",
+      "truck_uav_modules/data/xinjiekou/voxel_map_3d/occupancy.npy": "be81c23f2ca62e6ae90d8f28139eacb295ce2bd57d4fa28878a0246ba7b00bda"
+    },
+    "case2_baijiahu": {
+      "data/baijiahu/edge_task_registry.csv": "9f0cd4c6b3eab79be3cefb9a35ab3307ff571b8e0e0bcdf961c5552ac2b5ca6d",
+      "truck_uav_modules/data/baijiahu/buildings.geojson": "3903dd332fd1fcc31378713677af300f2f7abe884f28b6a71f2ff4295a39b956",
+      "truck_uav_modules/data/baijiahu/launch_recovery_nodes.geojson": "7b79d2f9bf8e6dd79b3672b8e840871d942222beb3f6d6e1488bda1db1815fe5",
+      "truck_uav_modules/data/baijiahu/road_network.graphml": "4f4324325885a2d5f552c59aae5cf9abbdcc4ffd363b06592079e48f34e1c00e",
+      "truck_uav_modules/data/baijiahu/voxel_map_3d/metadata.json": "68d3c53058f4a880920c68d163fcaae81907bd9532f46dfafe756d38c0b288f3",
+      "truck_uav_modules/data/baijiahu/voxel_map_3d/occupancy.npy": "5549ee17c58515ce076b2b69575a7fedc01741c2d86ff08d3064e31b66923b9d"
+    }
+  },
+  "policy": "frozen eval-mode masked argmax; NoisyNet disabled; epsilon=0",
+  "numerical_settings": "embedded audited configuration; no horizon, reward or task overrides",
+  "packages": {
+    "torch": "2.7.0",
+    "numpy": "1.26.4",
+    "pandas": "2.2.3",
+    "networkx": "3.2.1",
+    "shapely": "2.0.7",
+    "geopandas": "1.0.1",
+    "gymnasium": "1.1.1"
+  },
+  "python": "3.9.21",
+  "platform": "Windows",
+  "thread_limit": 1,
+  "openmp_duplicate_workaround": "TRUE"
+}

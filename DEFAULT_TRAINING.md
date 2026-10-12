@@ -1,17 +1,18 @@
-# Default Rainbow DQN training
+# Optional CS-RDQN training
 
-`configs/default_training.yaml` is the canonical Xinjiekou configuration and now records the 300,000 decision-transition training budget used in the manuscript protocol. The default model is candidate-aware Rainbow DQN with 25 action slots, 38 features per candidate, elapsed-time discounting (`gamma=0.99`, reference interval 60 s), NoisyNet exploration after a 1,000-step warm-up, and prioritized replay.
+**Use pretrained evaluation in README.md first.** Training is optional and was not run during release preparation.
 
-The scene uses a 10,800 s task-release horizon followed by a drain period of up to 1,800 s. Planning uses launch and recovery upper bounds of 70 s and 35 s; execution samples hidden truncated-normal durations in the ranges 50--70 s and 25--35 s. CAV planning uses staged mean speeds of 30 km/h, 20 km/h, and 30 km/h for the three traffic intervals, with a hidden bounded multiplier in [0.8, 1.2].
+Public entries are `configs/case1_xinjiekou.yaml` and `configs/case2_baijiahu.yaml`; old filenames remain compatibility aliases. Both set 300,000 decision transitions, seed 42, candidate-aware Rainbow DQN, 25 action slots and 38 candidate features. The unchanged main loop retains Double DQN, dueling heads, masked targets, NoisyNet after 1,000 warm-up transitions, PER and elapsed-time SMDP discounting (gamma 0.99, reference interval 60 s).
 
-Run the paper configuration with:
+Both training and rollout evaluation require authorized matching scene inputs. Geographic data/derivatives are excluded from the public index pending permission checks; local files and config paths are preserved. Run `python -m tools.check_data_assets` before the following optional commands. Code and original weights are MIT-licensed, not the geographic inputs.
 
 ```powershell
-python -B -m rl.train_masked_dqn `
-  --config configs\default_training.yaml `
-  --seed 42 `
-  --timesteps 300000 `
-  --disable-tensorboard
+python -m rl.train_masked_dqn --config configs/case1_xinjiekou.yaml --algo rainbow_dqn --seed 42 --timesteps 300000 --disable-tensorboard
+python -m rl.train_masked_dqn --config configs/case2_baijiahu.yaml --algo rainbow_dqn --seed 42 --timesteps 300000 --disable-tensorboard
 ```
 
-For a quick smoke test, override `--timesteps 2000` or use `--max-episodes 1`.
+New outputs go under `results/`, not `checkpoints/`. Release models are original final 300k policies, not newly trained or validation-best substitutes. They omit optimizer state and are evaluation artifacts, not resumable training snapshots. Resume training only from a corresponding unsanitized training checkpoint.
+
+Historical `configs/ablations/formal/*_full.yaml` files are unavailable. Original metadata and run summaries establish the training seed/budget, architecture, replay settings and reward signature. Public YAMLs preserve the audited current runtime and reproduce the original models' Table VIII evaluation. This does not certify that retraining reproduces original weights bitwise.
+
+Shared compatibility hooks remain where deleting them could affect the main simulator. The public factory/trainer exposes only `rainbow_dqn` / `candidate_aware`, not complete standalone baseline/ablation variants.

@@ -1,15 +1,17 @@
-numpy>=2.0,<3
-pandas>=2.2,<4
-PyYAML>=6.0,<7
-networkx>=3.3,<4
-shapely>=2.0,<3
-geopandas>=1.0,<2
-pyogrio>=0.9,<1
-matplotlib>=3.8,<4
-pillow>=10,<13
-scipy>=1.13,<2
-psutil>=5.9,<8
-gymnasium>=1.0,<2
-tensorboard>=2.17,<3
-pytest>=8,<9
-setuptools>=70,<82
+# Direct dependency versions used for verified reproduction (Python 3.9.21).
+# Install the CPU or CUDA PyTorch wheel first; see ENVIRONMENT_SETUP.md.
+torch==2.7.0
+numpy==1.26.4
+pandas==2.2.3
+PyYAML==6.0.2
+networkx==3.2.1
+shapely==2.0.7
+geopandas==1.0.1
+pyogrio==0.11.1
+matplotlib==3.9.4
+pillow==11.2.1
+scipy==1.13.1
+psutil==7.0.0
+gymnasium==1.1.1
+tensorboard==2.19.0
+setuptools==78.1.1

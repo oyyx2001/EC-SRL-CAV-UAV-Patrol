@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "Please cite this research software and the associated manuscript. Publication DOI and status have not been verified."
+type: software
+license: MIT
+title: "EC-SRL: Event-Driven Candidate-Sortie Reinforcement Learning for Dynamic CAV-UAV Cooperative Traffic Patrol"
+authors:
+  - family-names: Ouyang
+    given-names: Yuxiang
+  - family-names: Zhang
+    given-names: Shijia
+  - family-names: Rui
+    given-names: Yikang
+  - family-names: Ran
+    given-names: Bin
+repository-code: "https://github.com/oyyx2001/EC-SRL-CAV-UAV-Patrol"
+url: "https://github.com/oyyx2001/EC-SRL-CAV-UAV-Patrol"
+abstract: "Main CS-RDQN implementation and original pretrained policies for event-driven CAV-UAV cooperative traffic patrol."
+keywords:
+  - reinforcement learning
+  - traffic patrol
+  - CAV-UAV cooperation
+  - candidate-sortie planning

@@ -1,0 +1,53 @@
+# Baijiahu training entry point. All model, reward, task-generation and
+# time-aware discount settings inherit from the canonical default config.
+base: case1_xinjiekou.yaml
+
+project:
+  name: case2_baijiahu
+  results_dir: results/baijiahu/default_training
+  tensorboard_dir: results/baijiahu/default_training/tensorboard
+
+experiment:
+  scenario_name: case2_baijiahu
+  output_dir: results/baijiahu/default_training
+
+# Match the current Xinjiekou training mechanics while preserving the
+# Baijiahu-specific road network, voxel map, task registry and metadata.
+agents:
+  launch_time_s: 70.0
+  recovery_time_s: 35.0
+
+operational_time_uncertainty:
+  enabled: true
+
+time_varying_traffic:
+  enabled: true
+
+network:
+  type: compressed_region_graphml
+  graphml_file: truck_uav_modules/data/baijiahu/road_network.graphml
+  buildings_file: truck_uav_modules/data/baijiahu/buildings.geojson
+  launch_recovery_file: truck_uav_modules/data/baijiahu/launch_recovery_nodes.geojson
+  expected_node_count: 129
+  expected_edge_count: 247
+  map_version: baijiahu_default_v1
+
+uav_path_planning:
+  region: baijiahu
+  voxel_map_dir: truck_uav_modules/data/baijiahu/voxel_map_3d
+  map_version: baijiahu_voxel_map_3d_v1
+
+edge_tasks:
+  registry_path: data/baijiahu/edge_task_registry.csv
+
+rl:
+  timesteps: 300000
+  run_name: baijiahu_rainbow_default
+  model_name: baijiahu_rainbow_dqn_default.pt
+  train_scenario: case2_baijiahu
+  eval_scenario: case2_baijiahu
+
+training:
+  task_mapping_version: baijiahu_direct_compressed_edge_v1
+  path_planner_version: baijiahu_voxel_astar_3d_v1
+  map_version: baijiahu_voxel_map_3d_v1

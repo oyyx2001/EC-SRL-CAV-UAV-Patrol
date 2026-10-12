@@ -1,0 +1,18 @@
+[
+  {
+    "case": "case1_xinjiekou",
+    "artifact": "checkpoints/cs_rdqn_case1_xinjiekou.pt",
+    "sha256": "f2d07f011a9ed8926b8e51280ef7b4c7e2643be588ba949fa55a48d9e0f38dd1",
+    "state_dict_sha256": "b2a7ec238981a9351d712ba851e0f8b5aa67c7bbd5d012e3224bf595027fcc13",
+    "original_artifact_sha256": "42c587522c55fa055fc9c77a3120d4a072899bbdc1e751b1f4d8119f568f208f",
+    "weight_integrity_verified": true
+  },
+  {
+    "case": "case2_baijiahu",
+    "artifact": "checkpoints/cs_rdqn_case2_baijiahu.pt",
+    "sha256": "8953d8632646b9ce06a8f1c2269c3b3d881a8bdc29947eaa3d0722313013ee98",
+    "state_dict_sha256": "9855302fdbbfdfa3496af9a4899c3f00175b24ce9fa4b9c4f27250402c832e0d",
+    "original_artifact_sha256": "619b90b1a5d7a471d8ed14817a01ad3f07b14edd84532ccb0e3270776cd5dd31",
+    "weight_integrity_verified": true
+  }
+]

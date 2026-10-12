@@ -1,8 +1,2 @@
-geopandas>=1.0,<2
-networkx>=3.3,<4
-shapely>=2.0,<3
-pandas>=2.2,<4
-numpy>=2.0,<3
-pyyaml>=6.0,<7
-pyogrio>=0.9,<1
-pytest>=8.0,<9
+# Canonical validated dependencies are maintained at the repository root.
+-r ../requirements.txt

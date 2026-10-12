@@ -197,100 +197,6 @@ class CandidateAwareRainbowQNetwork(CandidateAwareDuelingQNetwork):
                 module.reset_noise()
 
 
-class StateOnlyQNetwork(nn.Module):
-    """Conventional fixed-slot Q network that cannot observe candidate features.
-
-    The joint-plan action mask and candidate ordering remain unchanged.  Each
-    output neuron represents one action slot, so the policy can learn a slot
-    preference from the global state without receiving any candidate-specific
-    attributes.
-    """
-
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        candidate_dim: int = 6,
-        global_hidden_dim: int = 256,
-    ) -> None:
-        super().__init__()
-        self.obs_dim = int(obs_dim)
-        self.action_dim = int(action_dim)
-        self.candidate_dim = int(candidate_dim)
-        # State-only is a formal joint-plan ablation.  Joint-plan observations
-        # contain one feature vector for every action slot, including safe slot
-        # zero, whereas the candidate-aware network treats slot zero separately.
-        self.global_dim = self.obs_dim - self.action_dim * self.candidate_dim
-        if self.action_dim < 2 or self.global_dim <= 0:
-            raise ValueError(
-                f"invalid state-only observation split: obs_dim={obs_dim}, "
-                f"action_dim={action_dim}, candidate_dim={candidate_dim}"
-            )
-        self.global_encoder = nn.Sequential(
-            nn.Linear(self.global_dim, global_hidden_dim),
-            nn.ReLU(),
-            nn.LayerNorm(global_hidden_dim),
-            nn.Linear(global_hidden_dim, global_hidden_dim),
-            nn.ReLU(),
-        )
-        self.q_head = nn.Linear(global_hidden_dim, self.action_dim)
-
-    def global_features(self, obs: torch.Tensor) -> torch.Tensor:
-        if obs.dim() == 1:
-            obs = obs.unsqueeze(0)
-        return obs[:, : self.global_dim]
-
-    def forward(self, obs: torch.Tensor, action_mask: torch.Tensor | None = None) -> torch.Tensor:
-        del action_mask
-        return self.q_head(self.global_encoder(self.global_features(obs)))
-
-
-class StateOnlyDuelingQNetwork(StateOnlyQNetwork):
-    """Dueling fixed-slot network for the state-only representation ablation."""
-
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        candidate_dim: int = 6,
-        global_hidden_dim: int = 256,
-    ) -> None:
-        super().__init__(obs_dim, action_dim, candidate_dim, global_hidden_dim)
-        self.value_head = nn.Linear(global_hidden_dim, 1)
-        self.advantage_head = nn.Linear(global_hidden_dim, self.action_dim)
-        del self.q_head
-
-    def forward(self, obs: torch.Tensor, action_mask: torch.Tensor | None = None) -> torch.Tensor:
-        embedding = self.global_encoder(self.global_features(obs))
-        value = self.value_head(embedding)
-        advantage = self.advantage_head(embedding)
-        if action_mask is None:
-            mean_advantage = advantage.mean(dim=1, keepdim=True)
-        else:
-            mask = action_mask.to(device=advantage.device, dtype=advantage.dtype)
-            denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-            mean_advantage = (advantage * mask).sum(dim=1, keepdim=True) / denom
-        return value + advantage - mean_advantage
-
-
-class StateOnlyRainbowQNetwork(StateOnlyDuelingQNetwork):
-    """NoisyNet Rainbow head over global state and fixed action-slot identity."""
-
-    def __init__(
-        self,
-        obs_dim: int,
-        action_dim: int,
-        candidate_dim: int = 6,
-        global_hidden_dim: int = 256,
-    ) -> None:
-        super().__init__(obs_dim, action_dim, candidate_dim, global_hidden_dim)
-        self.value_head = NoisyLinear(global_hidden_dim, 1)
-        self.advantage_head = NoisyLinear(global_hidden_dim, self.action_dim)
-
-    def reset_noise(self) -> None:
-        for module in self.modules():
-            if isinstance(module, NoisyLinear):
-                module.reset_noise()
 
 
 def reset_noisy_layers(module: nn.Module) -> None:
@@ -306,21 +212,9 @@ def make_q_network(
     candidate_dim: int = 6,
     architecture: str = "candidate_aware",
 ) -> nn.Module:
-    architecture = str(architecture).lower()
-    if architecture == "state_only":
-        if algo == "rainbow_dqn":
-            return StateOnlyRainbowQNetwork(obs_dim, action_dim, candidate_dim)
-        if algo == "dueling_double_dqn":
-            return StateOnlyDuelingQNetwork(obs_dim, action_dim, candidate_dim)
-        if algo in {"dqn", "double_dqn"}:
-            return StateOnlyQNetwork(obs_dim, action_dim, candidate_dim)
-        raise ValueError(f"unknown DQN algorithm: {algo}")
-    if architecture != "candidate_aware":
-        raise ValueError(f"unknown Q-network architecture: {architecture}")
-    if algo == "rainbow_dqn":
-        return CandidateAwareRainbowQNetwork(obs_dim, action_dim, candidate_dim)
-    if algo == "dueling_double_dqn":
-        return CandidateAwareDuelingQNetwork(obs_dim, action_dim, candidate_dim)
-    if algo in {"dqn", "double_dqn"}:
-        return CandidateAwareQNetwork(obs_dim, action_dim, candidate_dim)
-    raise ValueError(f"unknown DQN algorithm: {algo}")
+    """Construct the released CS-RDQN; inherited encoder/dueling code is unchanged."""
+    if str(architecture).lower() != "candidate_aware":
+        raise ValueError("The release includes only the main candidate-aware CS-RDQN")
+    if algo != "rainbow_dqn":
+        raise ValueError("The release includes only rainbow_dqn (CS-RDQN)")
+    return CandidateAwareRainbowQNetwork(obs_dim, action_dim, candidate_dim)

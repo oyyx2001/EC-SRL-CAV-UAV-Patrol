@@ -41,7 +41,7 @@ from dynamic_patrol_marl.rl.seed_scheduler import (
 from dynamic_patrol_marl.utils.config import load_config, project_root
 
 
-ALGORITHMS = ("dqn", "double_dqn", "dueling_double_dqn", "rainbow_dqn")
+ALGORITHMS = ("rainbow_dqn",)
 STAGE5_EVAL_METRICS = (
     "high_priority_response_time_s",
     "total_energy",
@@ -2108,8 +2108,8 @@ def build_hyperparams(args: argparse.Namespace, cfg: Dict | None = None) -> DQNH
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/default_training.yaml")
-    parser.add_argument("--algo", choices=ALGORITHMS, default=None, help="default: rl.algo from config, else dqn")
+    parser.add_argument("--config", default="configs/case1_xinjiekou.yaml")
+    parser.add_argument("--algo", choices=("rainbow_dqn",), default=None, help="public release: CS-RDQN (rainbow_dqn)")
     parser.add_argument("--timesteps", type=int, default=None, help="override total training timesteps")
     parser.add_argument("--seed", type=int, default=None, help="base seed for fixed/curriculum sampling")
     parser.add_argument("--seed-mode", choices=SEED_MODES, default=None, help="default: training.seed_mode from config, else fixed")
